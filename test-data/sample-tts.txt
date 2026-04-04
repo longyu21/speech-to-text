@@ -1,0 +1,2 @@
+This is a browser driven text to speech validation file.
+The system should read this document and produce playable audio.
