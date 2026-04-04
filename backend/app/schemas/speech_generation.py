@@ -25,5 +25,28 @@ class SpeechGenerationCreateResponse(BaseModel):
     audio_download_url: str
 
 
+class SpeechVoiceOption(BaseModel):
+    id: str
+    provider: str
+    display_name: str
+    character_name: str
+    persona_name: str | None
+    locale: str
+    language_label: str
+    gender: str | None
+    source: str
+    is_online: bool
+    personality_tags: list[str] = []
+
+
+class SpeechSpeedOption(BaseModel):
+    value: int
+    label: str
+
+
 class SpeechGenerationOptions(BaseModel):
     styles: list[str]
+    voices: list[SpeechVoiceOption]
+    speeds: list[SpeechSpeedOption]
+    favorite_voice_ids: list[str]
+    recent_voice_ids: list[str]

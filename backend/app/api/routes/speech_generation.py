@@ -1,3 +1,4 @@
+import json
 import mimetypes
 from datetime import datetime
 from pathlib import Path
@@ -12,19 +13,74 @@ from app.core.config import settings
 from app.core.security import get_current_user, require_upload_permission
 from app.core.time_utils import assume_utc_to_local
 from app.db.session import get_db
+from app.models.setting import Setting
 from app.models.speech_generation import SpeechGenerationRecord
 from app.models.user import User
-from app.schemas.speech_generation import SpeechGenerationCreateResponse, SpeechGenerationRecordRead
+from app.schemas.setting import SpeechFavoriteVoicesRead, SpeechFavoriteVoicesUpdate
+from app.schemas.speech_generation import SpeechGenerationCreateResponse, SpeechGenerationOptions, SpeechGenerationRecordRead
 from app.services.audit_service import write_audit_log
+from app.services.settings_service import build_speech_favorite_voices_key, build_speech_recent_voices_key, get_user_favorite_voice_ids, get_user_recent_voice_ids, parse_string_list_payload
 from app.services.storage_service import remove_upload_file
 from app.services.text_to_speech_service import (
     detect_supported_language,
     extract_text_from_document,
+    get_speech_generation_options,
     synthesize_speech,
 )
 
 
 router = APIRouter(prefix="/speech-generations", tags=["speech-generations"])
+
+
+@router.get("/options", response_model=SpeechGenerationOptions)
+async def read_speech_generation_options(
+    current_user: User = Depends(get_current_user),
+) -> SpeechGenerationOptions:
+    options = await get_speech_generation_options(
+        favorite_voice_ids=get_user_favorite_voice_ids(current_user.id),
+        recent_voice_ids=get_user_recent_voice_ids(current_user.id),
+    )
+    return SpeechGenerationOptions(**options)
+
+
+@router.get("/preferences", response_model=SpeechFavoriteVoicesRead)
+def read_speech_generation_preferences(
+    current_user: User = Depends(get_current_user),
+) -> SpeechFavoriteVoicesRead:
+    return SpeechFavoriteVoicesRead(
+        favorite_voice_ids=get_user_favorite_voice_ids(current_user.id),
+        recent_voice_ids=get_user_recent_voice_ids(current_user.id),
+    )
+
+
+@router.put("/preferences", response_model=SpeechFavoriteVoicesRead)
+def update_speech_generation_preferences(
+    payload: SpeechFavoriteVoicesUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SpeechFavoriteVoicesRead:
+    favorite_voice_ids = parse_string_list_payload(json.dumps(payload.favorite_voice_ids, ensure_ascii=False))
+    recent_voice_ids = parse_string_list_payload(json.dumps(payload.recent_voice_ids, ensure_ascii=False))
+    _upsert_voice_preference_setting(db, build_speech_favorite_voices_key(current_user.id), favorite_voice_ids)
+    _upsert_voice_preference_setting(db, build_speech_recent_voices_key(current_user.id), recent_voice_ids)
+    db.commit()
+    write_audit_log(
+        db,
+        action="speech_preferences.updated",
+        resource_type="setting",
+        details=f"Updated speech voice preferences favorites={len(favorite_voice_ids)} recent={len(recent_voice_ids)}",
+        user=current_user,
+    )
+    return SpeechFavoriteVoicesRead(favorite_voice_ids=favorite_voice_ids, recent_voice_ids=recent_voice_ids)
+
+
+def _upsert_voice_preference_setting(db: Session, setting_key: str, values: list[str]) -> None:
+    setting = db.query(Setting).filter(Setting.key == setting_key).first()
+    serialized = json.dumps(values, ensure_ascii=False)
+    if setting is None:
+        db.add(Setting(key=setting_key, value=serialized))
+        return
+    setting.value = serialized
 
 
 @router.get("", response_model=list[SpeechGenerationRecordRead])
@@ -43,6 +99,8 @@ async def generate_speech(
     text: str | None = Form(None),
     style: str = Form("normal"),
     output_format: str = Form("mp3"),
+    voice_id: str | None = Form(None),
+    speed_rate: int = Form(0),
     document: UploadFile | None = File(None),
     current_user: User = Depends(require_upload_permission),
     db: Session = Depends(get_db),
@@ -76,6 +134,8 @@ async def generate_speech(
             style=style,
             output_dir=settings.speech_output_path,
             output_format=output_format,
+            voice_id=voice_id,
+            speed_rate=speed_rate,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

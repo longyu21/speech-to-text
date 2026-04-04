@@ -10,6 +10,8 @@ from app.models.user import User
 MAX_UPLOAD_KEY = "max_upload_size_mb"
 JAPANESE_TTS_DICTIONARY_KEY = "japanese_tts_dictionary"
 JAPANESE_TRANSCRIPT_CORRECTIONS_KEY = "japanese_transcript_corrections"
+SPEECH_FAVORITE_VOICES_KEY_PREFIX = "speech_favorite_voices"
+SPEECH_RECENT_VOICES_KEY_PREFIX = "speech_recent_voices"
 
 
 def _load_json_setting_default(file_path) -> str:

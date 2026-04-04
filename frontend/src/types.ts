@@ -73,6 +73,38 @@ export interface SpeechGenerationRecord {
   user_id: number
 }
 
+export interface SpeechVoiceOption {
+  id: string
+  provider: string
+  display_name: string
+  character_name: string
+  persona_name: string | null
+  locale: string
+  language_label: string
+  gender: string | null
+  source: string
+  is_online: boolean
+  personality_tags: string[]
+}
+
+export interface SpeechSpeedOption {
+  value: number
+  label: string
+}
+
+export interface SpeechGenerationOptions {
+  styles: string[]
+  voices: SpeechVoiceOption[]
+  speeds: SpeechSpeedOption[]
+  favorite_voice_ids: string[]
+  recent_voice_ids: string[]
+}
+
+export interface SpeechFavoriteVoices {
+  favorite_voice_ids: string[]
+  recent_voice_ids: string[]
+}
+
 export interface SpeechGenerationCreateResponse {
   record: SpeechGenerationRecord
   language_label: string

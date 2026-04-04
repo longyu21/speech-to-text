@@ -1,4 +1,4 @@
-import type { AuditLog, BatchTranscriptionAccepted, SpeechGenerationCreateResponse, SpeechGenerationRecord, SpeechLanguageSettings, TranscriptionResult, UploadRecord, UploadSetting, User } from '@/types'
+import type { AuditLog, BatchTranscriptionAccepted, SpeechFavoriteVoices, SpeechGenerationCreateResponse, SpeechGenerationOptions, SpeechGenerationRecord, SpeechLanguageSettings, TranscriptionResult, UploadRecord, UploadSetting, User } from '@/types'
 
 const API_HOST = typeof window === 'undefined' ? '127.0.0.1' : window.location.hostname
 const API_BASE_URL = `http://${API_HOST}:8000/api`
@@ -155,13 +155,32 @@ export function listSpeechGenerations(token: string) {
   return request<SpeechGenerationRecord[]>('/speech-generations', {}, token)
 }
 
-export function createSpeechGeneration(payload: { text?: string; style: string; outputFormat: string; document?: File | null }, token: string) {
+export function getSpeechGenerationOptions(token: string) {
+  return request<SpeechGenerationOptions>('/speech-generations/options', {}, token)
+}
+
+export function getSpeechFavoriteVoices(token: string) {
+  return request<SpeechFavoriteVoices>('/speech-generations/preferences', {}, token)
+}
+
+export function updateSpeechFavoriteVoices(payload: SpeechFavoriteVoices, token: string) {
+  return request<SpeechFavoriteVoices>('/speech-generations/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }, token)
+}
+
+export function createSpeechGeneration(payload: { text?: string; style: string; outputFormat: string; voiceId?: string | null; speedRate: number; document?: File | null }, token: string) {
   const formData = new FormData()
   if (payload.text) {
     formData.append('text', payload.text)
   }
   formData.append('style', payload.style)
   formData.append('output_format', payload.outputFormat)
+  formData.append('speed_rate', String(payload.speedRate))
+  if (payload.voiceId) {
+    formData.append('voice_id', payload.voiceId)
+  }
   if (payload.document) {
     formData.append('document', payload.document)
   }
@@ -293,6 +312,12 @@ function translateApiError(path: string, detail: string): string {
     if (normalized === 'Unsupported speech output format') {
       return '不支持当前选择的语音导出格式。'
     }
+    if (normalized === 'Unsupported voice selection') {
+      return '当前选择的音色不受支持，请重新选择。'
+    }
+    if (normalized === 'Selected system voice is not available') {
+      return '当前选择的系统音色不可用，请重新选择。'
+    }
     if (normalized.startsWith('Speech synthesis failed:')) {
       return '语音生成失败，语音引擎暂时无法处理当前内容，请稍后重试。'
     }
@@ -313,6 +338,12 @@ function translateApiError(path: string, detail: string): string {
     }
     if (normalized === 'Audio download failed') {
       return '下载音频失败，请稍后重试。'
+    }
+  }
+
+  if (path.includes('/admin/settings')) {
+    if (normalized === 'Upload size must be greater than zero') {
+      return '上传大小必须大于 0。'
     }
   }
 

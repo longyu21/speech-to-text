@@ -60,8 +60,15 @@ async function handleSaveSetting(payload) {
     if (!authStore.token) {
         return;
     }
-    setting.value = await updateSpeechLanguageSettings(payload, authStore.token);
-    notice.value = '语音与转写词典设置已保存';
+    notice.value = '';
+    errorMessage.value = '';
+    try {
+        setting.value = await updateSpeechLanguageSettings(payload, authStore.token);
+        notice.value = '语音与转写词典设置已保存';
+    }
+    catch (error) {
+        errorMessage.value = error instanceof Error ? error.message : '设置保存失败';
+    }
 }
 onMounted(() => {
     loadAdminData().catch((error) => {

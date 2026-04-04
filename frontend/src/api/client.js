@@ -121,6 +121,18 @@ export function deleteUpload(uploadId, token) {
 export function listSpeechGenerations(token) {
     return request('/speech-generations', {}, token);
 }
+export function getSpeechGenerationOptions(token) {
+    return request('/speech-generations/options', {}, token);
+}
+export function getSpeechFavoriteVoices(token) {
+    return request('/speech-generations/preferences', {}, token);
+}
+export function updateSpeechFavoriteVoices(payload, token) {
+    return request('/speech-generations/preferences', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+    }, token);
+}
 export function createSpeechGeneration(payload, token) {
     const formData = new FormData();
     if (payload.text) {
@@ -128,6 +140,10 @@ export function createSpeechGeneration(payload, token) {
     }
     formData.append('style', payload.style);
     formData.append('output_format', payload.outputFormat);
+    formData.append('speed_rate', String(payload.speedRate));
+    if (payload.voiceId) {
+        formData.append('voice_id', payload.voiceId);
+    }
     if (payload.document) {
         formData.append('document', payload.document);
     }
@@ -251,6 +267,12 @@ function translateApiError(path, detail) {
         if (normalized === 'Unsupported speech output format') {
             return '不支持当前选择的语音导出格式。';
         }
+        if (normalized === 'Unsupported voice selection') {
+            return '当前选择的音色不受支持，请重新选择。';
+        }
+        if (normalized === 'Selected system voice is not available') {
+            return '当前选择的系统音色不可用，请重新选择。';
+        }
         if (normalized.startsWith('Speech synthesis failed:')) {
             return '语音生成失败，语音引擎暂时无法处理当前内容，请稍后重试。';
         }
@@ -270,6 +292,11 @@ function translateApiError(path, detail) {
         }
         if (normalized === 'Audio download failed') {
             return '下载音频失败，请稍后重试。';
+        }
+    }
+    if (path.includes('/admin/settings')) {
+        if (normalized === 'Upload size must be greater than zero') {
+            return '上传大小必须大于 0。';
         }
     }
     if (normalized === 'Request failed') {
