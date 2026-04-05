@@ -30,3 +30,9 @@ class TranscriptTranslationResult(BaseModel):
     target_language_label: str
     text: str
     segments: list[TranscriptSegmentRead] = []
+
+
+class TranscriptCorrectionUpdate(BaseModel):
+    target_language: TranslationLanguage | None = None
+    text: str | None = None
+    segments: list[TranscriptSegmentRead] | None = None

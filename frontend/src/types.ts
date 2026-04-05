@@ -55,6 +55,12 @@ export interface TranscriptTranslationResult {
   segments: TranscriptSegment[]
 }
 
+export interface TranscriptCorrectionPayload {
+  target_language?: TranslationLanguage
+  text?: string
+  segments?: TranscriptSegment[]
+}
+
 export interface BatchTranscriptionAccepted {
   batch_id: string
   uploads: UploadRecord[]

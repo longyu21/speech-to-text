@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, getTranslatedTranscript, listUploads } from '@/api/client'
+import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, getTranslatedTranscript, listUploads, updateTranscriptCorrection } from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
-import type { TranscriptSegment, TranscriptTranslationResult, TranslationLanguage, UploadRecord } from '@/types'
+import type { TranscriptCorrectionPayload, TranscriptSegment, TranscriptTranslationResult, TranslationLanguage, UploadRecord } from '@/types'
 
 const authStore = useAuthStore()
 const urlInput = ref('')
@@ -21,6 +21,10 @@ const currentTime = ref(0)
 const activeSegmentIndex = ref(-1)
 const mediaElement = ref<HTMLMediaElement | null>(null)
 const segmentListElement = ref<HTMLElement | null>(null)
+const transcriptEditMode = ref(false)
+const savingTranscript = ref(false)
+const transcriptDraftText = ref('')
+const transcriptDraftSegments = ref<TranscriptSegment[]>([])
 const MESSAGE_TIMEOUT_MS = 4000
 const recordStatusMap = new Map<number, string>()
 const segmentElementMap = new Map<number, HTMLElement>()
@@ -124,6 +128,17 @@ const canPreviewSelectedMedia = computed(() => {
   return ['extracting_audio', 'transcribing', 'completed', 'failed'].includes(selectedRecord.value.processing_stage || '')
 })
 const selectedProgressPercent = computed(() => normalizeProgressPercent(selectedRecord.value?.progress_percent ?? 0, selectedRecord.value?.status ?? 'queued'))
+const editingTranslation = computed(() => transcriptEditMode.value && translationEnabled.value)
+const canEditSelectedText = computed(() => {
+  if (!selectedRecord.value || selectedRecord.value.status !== 'completed') {
+    return false
+  }
+  if (translationEnabled.value) {
+    return Boolean(selectedTranslation.value)
+  }
+  return selectedHasTranscript.value
+})
+const transcriptEditTitle = computed(() => editingTranslation.value ? `${translationLanguage.value.toUpperCase()} 翻译修正` : '原文修正')
 
 function resetMessageTimer(type: 'notice' | 'error') {
   if (type === 'notice' && noticeTimer !== null) {
@@ -308,7 +323,114 @@ async function handleDownloadTranscriptFile(uploadId: number) {
 }
 
 function handleSelect(record: UploadRecord) {
+  cancelTranscriptEdit()
   selectedId.value = record.id
+}
+
+function replaceRecordInState(updatedRecord: UploadRecord) {
+  records.value = records.value.map((record) => record.id === updatedRecord.id ? updatedRecord : record)
+}
+
+function beginTranscriptEdit() {
+  if (!selectedRecord.value) {
+    return
+  }
+  transcriptEditMode.value = true
+  if (translationEnabled.value && selectedTranslation.value) {
+    transcriptDraftSegments.value = (selectedTranslation.value.segments ?? []).map((segment) => ({ ...segment }))
+    transcriptDraftText.value = selectedTranslation.value.text ?? ''
+    return
+  }
+  transcriptDraftSegments.value = (selectedRecord.value.transcript_segments ?? []).map((segment) => ({ ...segment }))
+  transcriptDraftText.value = selectedRecord.value.transcript_text ?? ''
+}
+
+function cancelTranscriptEdit() {
+  transcriptEditMode.value = false
+  transcriptDraftText.value = ''
+  transcriptDraftSegments.value = []
+}
+
+async function handleStartTranscriptEdit() {
+  if (!selectedRecord.value) {
+    return
+  }
+  errorMessage.value = ''
+  if (translationEnabled.value && !selectedTranslation.value) {
+    try {
+      await ensureTranslation(selectedRecord.value)
+    } catch (error) {
+      errorMessage.value = error instanceof Error ? error.message : '翻译加载失败'
+      return
+    }
+  }
+  beginTranscriptEdit()
+}
+
+async function handleSaveTranscriptEdit() {
+  if (!authStore.token || !selectedRecord.value || savingTranscript.value) {
+    return
+  }
+
+  const payload: TranscriptCorrectionPayload = editingTranslation.value
+    ? { target_language: translationLanguage.value }
+    : {}
+
+  if (transcriptDraftSegments.value.length) {
+    payload.segments = transcriptDraftSegments.value.map((segment) => ({
+      start: segment.start,
+      end: segment.end,
+      text: segment.text,
+    }))
+  } else {
+    payload.text = transcriptDraftText.value
+  }
+
+  savingTranscript.value = true
+  errorMessage.value = ''
+  try {
+    const updatedRecord = await updateTranscriptCorrection(selectedRecord.value.id, payload, authStore.token)
+    replaceRecordInState(updatedRecord)
+
+    if (editingTranslation.value) {
+      const nextTranslation: TranscriptTranslationResult = {
+        target_language: translationLanguage.value,
+        target_language_label: selectedTranslation.value?.target_language_label ?? translationOptions.find((option) => option.value === translationLanguage.value)?.label ?? translationLanguage.value,
+        text: transcriptDraftSegments.value.length
+          ? transcriptDraftSegments.value.map((segment) => segment.text.trim()).filter(Boolean).join('\n')
+          : transcriptDraftText.value.trim(),
+        segments: transcriptDraftSegments.value.map((segment) => ({ ...segment })),
+      }
+      translationCache.value = {
+        ...translationCache.value,
+        [updatedRecord.id]: {
+          ...(translationCache.value[updatedRecord.id] ?? {}),
+          [translationLanguage.value]: nextTranslation,
+        },
+      }
+    } else {
+      translationCache.value = {
+        ...translationCache.value,
+        [updatedRecord.id]: {},
+      }
+    }
+
+    notice.value = editingTranslation.value ? '翻译文本已保存修正。' : '原文已保存修正。'
+    cancelTranscriptEdit()
+    await nextTick()
+    setMediaElementState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '文本修正保存失败'
+  } finally {
+    savingTranscript.value = false
+  }
+}
+
+function handleSegmentCardClick(segment: TranscriptSegment) {
+  if (transcriptEditMode.value) {
+    return
+  }
+  seekToSegment(segment)
 }
 
 async function handleDelete(recordId: number) {
@@ -350,6 +472,12 @@ function setSegmentElement(index: number, element: Element | { $el?: Element | n
     return
   }
   segmentElementMap.delete(index)
+}
+
+function createSegmentElementRef(index: number) {
+  return (element: Element | { $el?: Element | null } | null) => {
+    setSegmentElement(index, element)
+  }
 }
 
 function captureSegmentListElement(element: Element | { $el?: Element | null } | null) {
@@ -430,17 +558,29 @@ watch(errorMessage, () => {
   scheduleMessageClear('error')
 })
 
-watch(selectedRecord, async (record) => {
+watch(selectedRecord, async (record, previousRecord) => {
   if (!record) {
+    cancelTranscriptEdit()
     activeSegmentIndex.value = -1
     currentTime.value = 0
     segmentElementMap.clear()
     return
   }
+
+  const selectedRecordChanged = record.id !== previousRecord?.id
+  if (selectedRecordChanged) {
+    cancelTranscriptEdit()
+    currentTime.value = 0
+    activeSegmentIndex.value = -1
+  }
+
   selectedId.value = record.id
-  currentTime.value = 0
-  activeSegmentIndex.value = -1
-  if (translationEnabled.value && record.status === 'completed' && selectedHasTranscript.value) {
+  if (
+    translationEnabled.value
+    && record.status === 'completed'
+    && selectedHasTranscript.value
+    && (selectedRecordChanged || previousRecord?.status !== record.status)
+  ) {
     try {
       await ensureTranslation(record)
     } catch (error) {
@@ -452,6 +592,7 @@ watch(selectedRecord, async (record) => {
 })
 
 watch([translationEnabled, translationLanguage], async ([enabled]) => {
+  cancelTranscriptEdit()
   if (!enabled || !selectedRecord.value || !canTranslateSelected.value) {
     return
   }
@@ -532,7 +673,7 @@ onUnmounted(() => {
 
         <video
           v-if="selectedRecord && canPreviewSelectedMedia && isVideoSource && mediaUrl"
-          :key="selectedRecord.id"
+          :key="`video-${selectedRecord.id}`"
           :ref="captureMediaElement"
           class="media-player"
           controls
@@ -544,7 +685,7 @@ onUnmounted(() => {
         />
         <audio
           v-else-if="selectedRecord && canPreviewSelectedMedia && mediaUrl"
-          :key="selectedRecord.id"
+          :key="`audio-${selectedRecord.id}`"
           :ref="captureMediaElement"
           class="audio-player"
           controls
@@ -582,8 +723,32 @@ onUnmounted(() => {
       </section>
 
       <section class="panel sync-panel">
-        <p class="eyebrow">Transcript</p>
-        <h2>同步文本</h2>
+        <div class="player-header">
+          <div>
+            <p class="eyebrow">Transcript</p>
+            <h2>同步文本</h2>
+          </div>
+          <div class="table-actions">
+            <button
+              v-if="!transcriptEditMode"
+              class="secondary-button"
+              type="button"
+              :disabled="!canEditSelectedText || translationLoading"
+              @click="handleStartTranscriptEdit"
+            >
+              修正{{ translationEnabled ? '翻译文本' : '原文' }}
+            </button>
+            <template v-else>
+              <span class="status-badge status-badge--loading">{{ transcriptEditTitle }}</span>
+              <button class="primary-button" type="button" :disabled="savingTranscript" @click="handleSaveTranscriptEdit">
+                {{ savingTranscript ? '保存中...' : '保存修正' }}
+              </button>
+              <button class="ghost-button" type="button" :disabled="savingTranscript" @click="cancelTranscriptEdit">
+                取消
+              </button>
+            </template>
+          </div>
+        </div>
         <p v-if="selectedPersistentNotice" class="notice">{{ selectedPersistentNotice }}</p>
         <p v-if="translationStatusMessage" class="notice">{{ translationStatusMessage }}</p>
         <p v-if="selectedPersistentError" class="error-box">{{ selectedPersistentError }}</p>
@@ -597,26 +762,43 @@ onUnmounted(() => {
           </div>
         </div>
         <div v-if="selectedSegments.length" :ref="captureSegmentListElement" class="segment-list">
-          <button
+          <component
             v-for="(segment, index) in selectedSegments"
             :key="`${selectedRecord?.id}-${index}`"
-            :ref="(element) => setSegmentElement(index, element)"
+            :is="transcriptEditMode ? 'div' : 'button'"
+            :ref="createSegmentElementRef(index)"
             class="segment-card"
             :class="{ active: index === activeSegmentIndex }"
-            type="button"
-            @click="seekToSegment(segment)"
+            :type="transcriptEditMode ? undefined : 'button'"
+            @click="handleSegmentCardClick(segment)"
           >
             <span class="segment-time">{{ formatTime(segment.start) }} - {{ formatTime(segment.end) }}</span>
-            <span class="segment-text">{{ segment.text }}</span>
-            <span v-if="translationEnabled && translatedSegments[index]?.text && translatedSegments[index].text !== segment.text" class="segment-text-secondary">{{ translatedSegments[index].text }}</span>
+            <textarea
+              v-if="transcriptEditMode && transcriptDraftSegments[index]"
+              v-model="transcriptDraftSegments[index].text"
+              class="segment-editor"
+              rows="2"
+              @click.stop
+            ></textarea>
+            <span v-else class="segment-text">{{ segment.text }}</span>
+            <span v-if="transcriptEditMode && translationEnabled" class="segment-text-secondary">{{ segment.text }}</span>
+            <span v-else-if="translationEnabled && translatedSegments[index]?.text && translatedSegments[index].text !== segment.text" class="segment-text-secondary">{{ translatedSegments[index].text }}</span>
             <span v-else-if="showTranslationSkeleton" class="segment-text-skeleton"></span>
-          </button>
+          </component>
         </div>
         <div v-else-if="selectedRecord?.transcript_text" class="plain-transcript-stack">
-          <div class="plain-transcript-box">
+          <textarea
+            v-if="transcriptEditMode"
+            v-model="transcriptDraftText"
+            class="plain-transcript-box transcript-editor"
+          ></textarea>
+          <div v-else class="plain-transcript-box">
+            {{ translationEnabled && translatedTranscriptText ? translatedTranscriptText : selectedRecord.transcript_text }}
+          </div>
+          <div v-if="transcriptEditMode && translationEnabled" class="plain-transcript-box plain-transcript-box--secondary">
             {{ selectedRecord.transcript_text }}
           </div>
-          <div v-if="translationEnabled && translatedTranscriptText && translatedTranscriptText !== selectedRecord.transcript_text" class="plain-transcript-box plain-transcript-box--secondary">
+          <div v-else-if="translationEnabled && translatedTranscriptText && translatedTranscriptText !== selectedRecord.transcript_text" class="plain-transcript-box plain-transcript-box--secondary">
             {{ translatedTranscriptText }}
           </div>
           <div v-else-if="showTranslationSkeleton" class="plain-transcript-box plain-transcript-box--secondary plain-transcript-box--skeleton">

@@ -1,4 +1,4 @@
-import type { AuditLog, BatchTranscriptionAccepted, SpeechFavoriteVoices, SpeechGenerationCreateResponse, SpeechGenerationOptions, SpeechGenerationRecord, SpeechLanguageSettings, TranscriptTranslationResult, TranslationLanguage, TranscriptionResult, UploadRecord, UploadSetting, User } from '@/types'
+import type { AuditLog, BatchTranscriptionAccepted, SpeechFavoriteVoices, SpeechGenerationCreateResponse, SpeechGenerationOptions, SpeechGenerationRecord, SpeechLanguageSettings, TranscriptCorrectionPayload, TranscriptTranslationResult, TranslationLanguage, TranscriptionResult, UploadRecord, UploadSetting, User } from '@/types'
 
 const API_HOST = typeof window === 'undefined' ? '127.0.0.1' : window.location.hostname
 const API_BASE_URL = `http://${API_HOST}:8000/api`
@@ -119,6 +119,13 @@ export async function downloadTranscript(uploadId: number, token: string, option
 
 export function getTranslatedTranscript(uploadId: number, targetLanguage: TranslationLanguage, token: string) {
   return request<TranscriptTranslationResult>(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, {}, token)
+}
+
+export function updateTranscriptCorrection(uploadId: number, payload: TranscriptCorrectionPayload, token: string) {
+  return request<UploadRecord>(`/transcriptions/${uploadId}/text`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }, token)
 }
 
 export async function downloadTranscriptText(uploadId: number, token: string, options: DownloadTranscriptTextOptions = {}) {
@@ -324,7 +331,26 @@ function translateApiError(path: string, detail: string): string {
     if (normalized.startsWith('YouTube 当前要求登录态验证。')) {
       return normalized
     }
+    if (normalized === 'Only completed transcripts can be edited') {
+      return '仅已完成的转写记录支持文本修正。'
+    }
+    if (normalized === 'Edited transcript cannot be empty') {
+      return '修正后的文本不能为空。'
+    }
     return `URL 解析失败：${normalized}`
+  }
+
+  if (path.includes('/transcriptions/') && path.endsWith('/text')) {
+    if (normalized === 'Only completed transcripts can be edited') {
+      return '仅已完成的转写记录支持文本修正。'
+    }
+    if (normalized === 'Edited transcript cannot be empty') {
+      return '修正后的文本不能为空。'
+    }
+    if (normalized === 'Transcript not available') {
+      return '当前记录还没有可修正的文本内容。'
+    }
+    return `文本修正失败：${normalized}`
   }
 
   if (path.includes('/transcriptions/upload') || path.includes('/transcriptions/batch-upload')) {

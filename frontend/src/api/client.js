@@ -85,6 +85,12 @@ export async function downloadTranscript(uploadId, token, options = {}) {
 export function getTranslatedTranscript(uploadId, targetLanguage, token) {
     return request(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, {}, token);
 }
+export function updateTranscriptCorrection(uploadId, payload, token) {
+    return request(`/transcriptions/${uploadId}/text`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+    }, token);
+}
 export async function downloadTranscriptText(uploadId, token, options = {}) {
     const searchParams = new URLSearchParams();
     if (options.includeTranslation) {
@@ -262,7 +268,25 @@ function translateApiError(path, detail) {
         if (normalized.startsWith('YouTube 当前要求登录态验证。')) {
             return normalized;
         }
+        if (normalized === 'Only completed transcripts can be edited') {
+            return '仅已完成的转写记录支持文本修正。';
+        }
+        if (normalized === 'Edited transcript cannot be empty') {
+            return '修正后的文本不能为空。';
+        }
         return `URL 解析失败：${normalized}`;
+    }
+    if (path.includes('/transcriptions/') && path.endsWith('/text')) {
+        if (normalized === 'Only completed transcripts can be edited') {
+            return '仅已完成的转写记录支持文本修正。';
+        }
+        if (normalized === 'Edited transcript cannot be empty') {
+            return '修正后的文本不能为空。';
+        }
+        if (normalized === 'Transcript not available') {
+            return '当前记录还没有可修正的文本内容。';
+        }
+        return `文本修正失败：${normalized}`;
     }
     if (path.includes('/transcriptions/upload') || path.includes('/transcriptions/batch-upload')) {
         if (normalized.startsWith('Unsupported media format:')) {

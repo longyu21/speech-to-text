@@ -1,5 +1,5 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, getTranslatedTranscript, listUploads } from '@/api/client';
+import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, getTranslatedTranscript, listUploads, updateTranscriptCorrection } from '@/api/client';
 import { useAuthStore } from '@/stores/auth';
 const authStore = useAuthStore();
 const urlInput = ref('');
@@ -17,6 +17,10 @@ const currentTime = ref(0);
 const activeSegmentIndex = ref(-1);
 const mediaElement = ref(null);
 const segmentListElement = ref(null);
+const transcriptEditMode = ref(false);
+const savingTranscript = ref(false);
+const transcriptDraftText = ref('');
+const transcriptDraftSegments = ref([]);
 const MESSAGE_TIMEOUT_MS = 4000;
 const recordStatusMap = new Map();
 const segmentElementMap = new Map();
@@ -116,6 +120,17 @@ const canPreviewSelectedMedia = computed(() => {
     return ['extracting_audio', 'transcribing', 'completed', 'failed'].includes(selectedRecord.value.processing_stage || '');
 });
 const selectedProgressPercent = computed(() => normalizeProgressPercent(selectedRecord.value?.progress_percent ?? 0, selectedRecord.value?.status ?? 'queued'));
+const editingTranslation = computed(() => transcriptEditMode.value && translationEnabled.value);
+const canEditSelectedText = computed(() => {
+    if (!selectedRecord.value || selectedRecord.value.status !== 'completed') {
+        return false;
+    }
+    if (translationEnabled.value) {
+        return Boolean(selectedTranslation.value);
+    }
+    return selectedHasTranscript.value;
+});
+const transcriptEditTitle = computed(() => editingTranslation.value ? `${translationLanguage.value.toUpperCase()} 翻译修正` : '原文修正');
 function resetMessageTimer(type) {
     if (type === 'notice' && noticeTimer !== null) {
         window.clearTimeout(noticeTimer);
@@ -285,7 +300,108 @@ async function handleDownloadTranscriptFile(uploadId) {
     }
 }
 function handleSelect(record) {
+    cancelTranscriptEdit();
     selectedId.value = record.id;
+}
+function replaceRecordInState(updatedRecord) {
+    records.value = records.value.map((record) => record.id === updatedRecord.id ? updatedRecord : record);
+}
+function beginTranscriptEdit() {
+    if (!selectedRecord.value) {
+        return;
+    }
+    transcriptEditMode.value = true;
+    if (translationEnabled.value && selectedTranslation.value) {
+        transcriptDraftSegments.value = (selectedTranslation.value.segments ?? []).map((segment) => ({ ...segment }));
+        transcriptDraftText.value = selectedTranslation.value.text ?? '';
+        return;
+    }
+    transcriptDraftSegments.value = (selectedRecord.value.transcript_segments ?? []).map((segment) => ({ ...segment }));
+    transcriptDraftText.value = selectedRecord.value.transcript_text ?? '';
+}
+function cancelTranscriptEdit() {
+    transcriptEditMode.value = false;
+    transcriptDraftText.value = '';
+    transcriptDraftSegments.value = [];
+}
+async function handleStartTranscriptEdit() {
+    if (!selectedRecord.value) {
+        return;
+    }
+    errorMessage.value = '';
+    if (translationEnabled.value && !selectedTranslation.value) {
+        try {
+            await ensureTranslation(selectedRecord.value);
+        }
+        catch (error) {
+            errorMessage.value = error instanceof Error ? error.message : '翻译加载失败';
+            return;
+        }
+    }
+    beginTranscriptEdit();
+}
+async function handleSaveTranscriptEdit() {
+    if (!authStore.token || !selectedRecord.value || savingTranscript.value) {
+        return;
+    }
+    const payload = editingTranslation.value
+        ? { target_language: translationLanguage.value }
+        : {};
+    if (transcriptDraftSegments.value.length) {
+        payload.segments = transcriptDraftSegments.value.map((segment) => ({
+            start: segment.start,
+            end: segment.end,
+            text: segment.text,
+        }));
+    }
+    else {
+        payload.text = transcriptDraftText.value;
+    }
+    savingTranscript.value = true;
+    errorMessage.value = '';
+    try {
+        const updatedRecord = await updateTranscriptCorrection(selectedRecord.value.id, payload, authStore.token);
+        replaceRecordInState(updatedRecord);
+        if (editingTranslation.value) {
+            const nextTranslation = {
+                target_language: translationLanguage.value,
+                target_language_label: selectedTranslation.value?.target_language_label ?? translationOptions.find((option) => option.value === translationLanguage.value)?.label ?? translationLanguage.value,
+                text: transcriptDraftSegments.value.length
+                    ? transcriptDraftSegments.value.map((segment) => segment.text.trim()).filter(Boolean).join('\n')
+                    : transcriptDraftText.value.trim(),
+                segments: transcriptDraftSegments.value.map((segment) => ({ ...segment })),
+            };
+            translationCache.value = {
+                ...translationCache.value,
+                [updatedRecord.id]: {
+                    ...(translationCache.value[updatedRecord.id] ?? {}),
+                    [translationLanguage.value]: nextTranslation,
+                },
+            };
+        }
+        else {
+            translationCache.value = {
+                ...translationCache.value,
+                [updatedRecord.id]: {},
+            };
+        }
+        notice.value = editingTranslation.value ? '翻译文本已保存修正。' : '原文已保存修正。';
+        cancelTranscriptEdit();
+        await nextTick();
+        setMediaElementState();
+    }
+    catch (error) {
+        errorMessage.value = error instanceof Error ? error.message : '文本修正保存失败';
+    }
+    finally {
+        savingTranscript.value = false;
+    }
+}
+function handleSegmentCardClick(segment) {
+    if (transcriptEditMode.value) {
+        return;
+    }
+    seekToSegment(segment);
 }
 async function handleDelete(recordId) {
     if (!authStore.token || deletingRecordId.value !== null) {
@@ -326,6 +442,11 @@ function setSegmentElement(index, element) {
         return;
     }
     segmentElementMap.delete(index);
+}
+function createSegmentElementRef(index) {
+    return (element) => {
+        setSegmentElement(index, element);
+    };
 }
 function captureSegmentListElement(element) {
     const resolvedElement = element instanceof HTMLElement
@@ -395,17 +516,25 @@ watch(notice, () => {
 watch(errorMessage, () => {
     scheduleMessageClear('error');
 });
-watch(selectedRecord, async (record) => {
+watch(selectedRecord, async (record, previousRecord) => {
     if (!record) {
+        cancelTranscriptEdit();
         activeSegmentIndex.value = -1;
         currentTime.value = 0;
         segmentElementMap.clear();
         return;
     }
+    const selectedRecordChanged = record.id !== previousRecord?.id;
+    if (selectedRecordChanged) {
+        cancelTranscriptEdit();
+        currentTime.value = 0;
+        activeSegmentIndex.value = -1;
+    }
     selectedId.value = record.id;
-    currentTime.value = 0;
-    activeSegmentIndex.value = -1;
-    if (translationEnabled.value && record.status === 'completed' && selectedHasTranscript.value) {
+    if (translationEnabled.value
+        && record.status === 'completed'
+        && selectedHasTranscript.value
+        && (selectedRecordChanged || previousRecord?.status !== record.status)) {
         try {
             await ensureTranslation(record);
         }
@@ -417,6 +546,7 @@ watch(selectedRecord, async (record) => {
     setMediaElementState();
 });
 watch([translationEnabled, translationLanguage], async ([enabled]) => {
+    cancelTranscriptEdit();
     if (!enabled || !selectedRecord.value || !canTranslateSelected.value) {
         return;
     }
@@ -561,7 +691,7 @@ if (__VLS_ctx.selectedRecord && __VLS_ctx.canPreviewSelectedMedia && __VLS_ctx.i
         ...{ onTimeupdate: (__VLS_ctx.handlePlaybackSync) },
         ...{ onLoadedmetadata: (__VLS_ctx.handlePlaybackSync) },
         ...{ onSeeked: (__VLS_ctx.handlePlaybackSync) },
-        key: (__VLS_ctx.selectedRecord.id),
+        key: (`video-${__VLS_ctx.selectedRecord.id}`),
         ref: (__VLS_ctx.captureMediaElement),
         ...{ class: "media-player" },
         controls: true,
@@ -574,7 +704,7 @@ else if (__VLS_ctx.selectedRecord && __VLS_ctx.canPreviewSelectedMedia && __VLS_
         ...{ onTimeupdate: (__VLS_ctx.handlePlaybackSync) },
         ...{ onLoadedmetadata: (__VLS_ctx.handlePlaybackSync) },
         ...{ onSeeked: (__VLS_ctx.handlePlaybackSync) },
-        key: (__VLS_ctx.selectedRecord.id),
+        key: (`audio-${__VLS_ctx.selectedRecord.id}`),
         ref: (__VLS_ctx.captureMediaElement),
         ...{ class: "audio-player" },
         controls: true,
@@ -656,10 +786,45 @@ if (__VLS_ctx.selectedRecord) {
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "panel sync-panel" },
 });
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "player-header" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
     ...{ class: "eyebrow" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "table-actions" },
+});
+if (!__VLS_ctx.transcriptEditMode) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.handleStartTranscriptEdit) },
+        ...{ class: "secondary-button" },
+        type: "button",
+        disabled: (!__VLS_ctx.canEditSelectedText || __VLS_ctx.translationLoading),
+    });
+    (__VLS_ctx.translationEnabled ? '翻译文本' : '原文');
+}
+else {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+        ...{ class: "status-badge status-badge--loading" },
+    });
+    (__VLS_ctx.transcriptEditTitle);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.handleSaveTranscriptEdit) },
+        ...{ class: "primary-button" },
+        type: "button",
+        disabled: (__VLS_ctx.savingTranscript),
+    });
+    (__VLS_ctx.savingTranscript ? '保存中...' : '保存修正');
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.cancelTranscriptEdit) },
+        ...{ class: "ghost-button" },
+        type: "button",
+        disabled: (__VLS_ctx.savingTranscript),
+    });
+}
 if (__VLS_ctx.selectedPersistentNotice) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
         ...{ class: "notice" },
@@ -704,28 +869,61 @@ if (__VLS_ctx.selectedSegments.length) {
         ...{ class: "segment-list" },
     });
     for (const [segment, index] of __VLS_getVForSourceType((__VLS_ctx.selectedSegments))) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-            ...{ onClick: (...[$event]) => {
-                    if (!(__VLS_ctx.selectedSegments.length))
-                        return;
-                    __VLS_ctx.seekToSegment(segment);
-                } },
+        const __VLS_8 = ((__VLS_ctx.transcriptEditMode ? 'div' : 'button'));
+        // @ts-ignore
+        const __VLS_9 = __VLS_asFunctionalComponent(__VLS_8, new __VLS_8({
+            ...{ 'onClick': {} },
             key: (`${__VLS_ctx.selectedRecord?.id}-${index}`),
-            ref: ((element) => __VLS_ctx.setSegmentElement(index, element)),
+            ref: (__VLS_ctx.createSegmentElementRef(index)),
             ...{ class: "segment-card" },
             ...{ class: ({ active: index === __VLS_ctx.activeSegmentIndex }) },
-            type: "button",
-        });
+            type: (__VLS_ctx.transcriptEditMode ? undefined : 'button'),
+        }));
+        const __VLS_10 = __VLS_9({
+            ...{ 'onClick': {} },
+            key: (`${__VLS_ctx.selectedRecord?.id}-${index}`),
+            ref: (__VLS_ctx.createSegmentElementRef(index)),
+            ...{ class: "segment-card" },
+            ...{ class: ({ active: index === __VLS_ctx.activeSegmentIndex }) },
+            type: (__VLS_ctx.transcriptEditMode ? undefined : 'button'),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_9));
+        let __VLS_12;
+        let __VLS_13;
+        let __VLS_14;
+        const __VLS_15 = {
+            onClick: (...[$event]) => {
+                if (!(__VLS_ctx.selectedSegments.length))
+                    return;
+                __VLS_ctx.handleSegmentCardClick(segment);
+            }
+        };
+        __VLS_11.slots.default;
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
             ...{ class: "segment-time" },
         });
         (__VLS_ctx.formatTime(segment.start));
         (__VLS_ctx.formatTime(segment.end));
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
-            ...{ class: "segment-text" },
-        });
-        (segment.text);
-        if (__VLS_ctx.translationEnabled && __VLS_ctx.translatedSegments[index]?.text && __VLS_ctx.translatedSegments[index].text !== segment.text) {
+        if (__VLS_ctx.transcriptEditMode && __VLS_ctx.transcriptDraftSegments[index]) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.textarea, __VLS_intrinsicElements.textarea)({
+                ...{ onClick: () => { } },
+                value: (__VLS_ctx.transcriptDraftSegments[index].text),
+                ...{ class: "segment-editor" },
+                rows: "2",
+            });
+        }
+        else {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: "segment-text" },
+            });
+            (segment.text);
+        }
+        if (__VLS_ctx.transcriptEditMode && __VLS_ctx.translationEnabled) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: "segment-text-secondary" },
+            });
+            (segment.text);
+        }
+        else if (__VLS_ctx.translationEnabled && __VLS_ctx.translatedSegments[index]?.text && __VLS_ctx.translatedSegments[index].text !== segment.text) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
                 ...{ class: "segment-text-secondary" },
             });
@@ -736,17 +934,32 @@ if (__VLS_ctx.selectedSegments.length) {
                 ...{ class: "segment-text-skeleton" },
             });
         }
+        var __VLS_11;
     }
 }
 else if (__VLS_ctx.selectedRecord?.transcript_text) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "plain-transcript-stack" },
     });
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "plain-transcript-box" },
-    });
-    (__VLS_ctx.selectedRecord.transcript_text);
-    if (__VLS_ctx.translationEnabled && __VLS_ctx.translatedTranscriptText && __VLS_ctx.translatedTranscriptText !== __VLS_ctx.selectedRecord.transcript_text) {
+    if (__VLS_ctx.transcriptEditMode) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.textarea, __VLS_intrinsicElements.textarea)({
+            value: (__VLS_ctx.transcriptDraftText),
+            ...{ class: "plain-transcript-box transcript-editor" },
+        });
+    }
+    else {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "plain-transcript-box" },
+        });
+        (__VLS_ctx.translationEnabled && __VLS_ctx.translatedTranscriptText ? __VLS_ctx.translatedTranscriptText : __VLS_ctx.selectedRecord.transcript_text);
+    }
+    if (__VLS_ctx.transcriptEditMode && __VLS_ctx.translationEnabled) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "plain-transcript-box plain-transcript-box--secondary" },
+        });
+        (__VLS_ctx.selectedRecord.transcript_text);
+    }
+    else if (__VLS_ctx.translationEnabled && __VLS_ctx.translatedTranscriptText && __VLS_ctx.translatedTranscriptText !== __VLS_ctx.selectedRecord.transcript_text) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "plain-transcript-box plain-transcript-box--secondary" },
         });
@@ -908,7 +1121,14 @@ else {
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['sync-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['player-header']} */ ;
 /** @type {__VLS_StyleScopedClasses['eyebrow']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-badge--loading']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
 /** @type {__VLS_StyleScopedClasses['error-box']} */ ;
@@ -920,11 +1140,17 @@ else {
 /** @type {__VLS_StyleScopedClasses['segment-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['active']} */ ;
 /** @type {__VLS_StyleScopedClasses['segment-time']} */ ;
+/** @type {__VLS_StyleScopedClasses['segment-editor']} */ ;
 /** @type {__VLS_StyleScopedClasses['segment-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['segment-text-secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['segment-text-secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['segment-text-skeleton']} */ ;
 /** @type {__VLS_StyleScopedClasses['plain-transcript-stack']} */ ;
 /** @type {__VLS_StyleScopedClasses['plain-transcript-box']} */ ;
+/** @type {__VLS_StyleScopedClasses['transcript-editor']} */ ;
+/** @type {__VLS_StyleScopedClasses['plain-transcript-box']} */ ;
+/** @type {__VLS_StyleScopedClasses['plain-transcript-box']} */ ;
+/** @type {__VLS_StyleScopedClasses['plain-transcript-box--secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['plain-transcript-box']} */ ;
 /** @type {__VLS_StyleScopedClasses['plain-transcript-box--secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['plain-transcript-box']} */ ;
@@ -970,6 +1196,10 @@ const __VLS_self = (await import('vue')).defineComponent({
             deletingRecordId: deletingRecordId,
             currentTime: currentTime,
             activeSegmentIndex: activeSegmentIndex,
+            transcriptEditMode: transcriptEditMode,
+            savingTranscript: savingTranscript,
+            transcriptDraftText: transcriptDraftText,
+            transcriptDraftSegments: transcriptDraftSegments,
             translationOptions: translationOptions,
             downloadFormatOptions: downloadFormatOptions,
             urlRecords: urlRecords,
@@ -986,17 +1216,22 @@ const __VLS_self = (await import('vue')).defineComponent({
             isVideoSource: isVideoSource,
             canPreviewSelectedMedia: canPreviewSelectedMedia,
             selectedProgressPercent: selectedProgressPercent,
+            canEditSelectedText: canEditSelectedText,
+            transcriptEditTitle: transcriptEditTitle,
             normalizeProgressPercent: normalizeProgressPercent,
             formatProgressStage: formatProgressStage,
             handleSubmit: handleSubmit,
             handleDownloadTranscriptFile: handleDownloadTranscriptFile,
             handleSelect: handleSelect,
+            cancelTranscriptEdit: cancelTranscriptEdit,
+            handleStartTranscriptEdit: handleStartTranscriptEdit,
+            handleSaveTranscriptEdit: handleSaveTranscriptEdit,
+            handleSegmentCardClick: handleSegmentCardClick,
             handleDelete: handleDelete,
-            setSegmentElement: setSegmentElement,
+            createSegmentElementRef: createSegmentElementRef,
             captureSegmentListElement: captureSegmentListElement,
             captureMediaElement: captureMediaElement,
             handlePlaybackSync: handlePlaybackSync,
-            seekToSegment: seekToSegment,
             formatTime: formatTime,
         };
     },

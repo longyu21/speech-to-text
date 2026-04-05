@@ -17,7 +17,7 @@ from app.db.session import get_db
 from app.models.setting import Setting
 from app.models.upload import UploadRecord
 from app.models.user import User
-from app.schemas.transcription import BatchTranscriptionAccepted, TranscriptTranslationResult, TranscriptionResult, TranslationLanguage, UrlTranscriptionCreate
+from app.schemas.transcription import BatchTranscriptionAccepted, TranscriptCorrectionUpdate, TranscriptTranslationResult, TranscriptionResult, TranslationLanguage, UrlTranscriptionCreate
 from app.schemas.upload import UploadRecordRead
 from app.services.audit_service import write_audit_log
 from app.services.document_service import build_transcript_docx
@@ -36,6 +36,9 @@ from app.services.translation_service import TranslationServiceError, get_transl
 
 
 router = APIRouter(prefix="/transcriptions", tags=["transcriptions"])
+
+
+TRANSCRIPT_JOIN_WITHOUT_SPACES = {"zh", "ja"}
 
 
 def get_max_upload_size_mb(db: Session) -> int:
@@ -276,18 +279,8 @@ def download_transcript(
     if include_translation:
         if target_language is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target language is required when translation is enabled")
-        try:
-            translated_text, _ = translate_transcript(
-                upload.transcript_text,
-                upload.transcript_segments,
-                target_language,
-                upload.detected_language,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except TranslationServiceError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-        sections.append((f"翻译 ({get_translation_language_label(target_language)})", translated_text))
+        translated_result = _resolve_translation_result(upload, target_language)
+        sections.append((f"翻译 ({get_translation_language_label(target_language)})", translated_result.text))
 
     document_bytes = build_transcript_docx(upload.original_filename, sections)
     safe_filename = quote(Path(upload.original_filename).stem)
@@ -319,23 +312,13 @@ def download_transcript_text(
     if include_translation:
         if target_language is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target language is required when translation is enabled")
-        try:
-            translated_text, _ = translate_transcript(
-                upload.transcript_text,
-                upload.transcript_segments,
-                target_language,
-                upload.detected_language,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except TranslationServiceError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        translated_result = _resolve_translation_result(upload, target_language)
 
         translated_label = get_translation_language_label(target_language)
         source_label = upload.detected_language.upper() if upload.detected_language else "AUTO"
         response_text = "\n\n".join([
             f"原文 ({source_label})\n{upload.transcript_text}",
-            f"翻译 ({translated_label})\n{translated_text}",
+            f"翻译 ({translated_label})\n{translated_result.text}",
         ])
         filename_suffix = f"-translated-{target_language}"
 
@@ -357,24 +340,58 @@ def get_transcript_translation(
     if not upload.transcript_text:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
 
-    try:
-        translated_text, translated_segments = translate_transcript(
-            upload.transcript_text,
-            upload.transcript_segments,
-            target_language,
-            upload.detected_language,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except TranslationServiceError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return _resolve_translation_result(upload, target_language)
 
-    return TranscriptTranslationResult(
-        target_language=target_language,
-        target_language_label=get_translation_language_label(target_language),
-        text=translated_text,
-        segments=translated_segments,
+
+@router.put("/{upload_id}/text", response_model=UploadRecordRead)
+def update_transcript_text(
+    upload_id: int,
+    payload: TranscriptCorrectionUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadRecord:
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    if upload.status != "completed":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only completed transcripts can be edited")
+    if not upload.transcript_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
+
+    normalized_segments = _normalize_correction_segments(payload.segments)
+    normalized_text = _resolve_correction_text(
+        text=payload.text,
+        segments=normalized_segments,
+        language_code=payload.target_language or upload.detected_language,
     )
+    if not normalized_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Edited transcript cannot be empty")
+
+    if payload.target_language is None:
+        upload.transcript_text = normalized_text
+        upload.transcript_segments = normalized_segments
+        upload.translation_overrides = None
+        action = "upload.transcript_corrected"
+        details = f"Updated transcript text for {upload.original_filename}"
+    else:
+        translation_overrides = dict(upload.translation_overrides or {})
+        translation_overrides[payload.target_language] = {
+            "text": normalized_text,
+            "segments": normalized_segments,
+        }
+        upload.translation_overrides = translation_overrides
+        action = "upload.translation_corrected"
+        details = f"Updated {payload.target_language} translation for {upload.original_filename}"
+
+    db.commit()
+    db.refresh(upload)
+    write_audit_log(
+        db,
+        action=action,
+        resource_type="upload",
+        resource_id=upload.id,
+        details=details,
+        user=current_user,
+    )
+    return upload
 
 
 @router.get("/{upload_id}/media")
@@ -457,6 +474,90 @@ def _get_upload_with_access(db: Session, upload_id: int, current_user: User) -> 
     if not current_user.can_manage_files and upload.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
     return upload
+
+
+def _normalize_correction_segments(segments: list[object] | None) -> list[dict[str, object]] | None:
+    if segments is None:
+        return None
+
+    normalized_segments: list[dict[str, object]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            segment = segment.model_dump() if hasattr(segment, "model_dump") else None
+        if not isinstance(segment, dict):
+            continue
+
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = round(float(segment.get("start") or 0.0), 2)
+            end = round(float(segment.get("end") or 0.0), 2)
+        except (TypeError, ValueError):
+            start = 0.0
+            end = 0.0
+        normalized_segments.append({
+            "start": start,
+            "end": end,
+            "text": text,
+        })
+
+    return normalized_segments
+
+
+def _resolve_correction_text(*, text: str | None, segments: list[dict[str, object]] | None, language_code: str | None) -> str:
+    normalized_text = (text or "").strip()
+    if segments:
+        parts = [str(segment.get("text") or "").strip() for segment in segments if str(segment.get("text") or "").strip()]
+        if not parts:
+            return ""
+        normalized_language = (language_code or "").strip().lower()
+        return "".join(parts) if normalized_language in TRANSCRIPT_JOIN_WITHOUT_SPACES else "\n".join(parts)
+    return normalized_text
+
+
+def _get_translation_override(upload: UploadRecord, target_language: TranslationLanguage) -> TranscriptTranslationResult | None:
+    overrides = upload.translation_overrides or {}
+    override_entry = overrides.get(target_language)
+    if not isinstance(override_entry, dict):
+        return None
+
+    text = str(override_entry.get("text") or "").strip()
+    segments = _normalize_correction_segments(override_entry.get("segments")) or []
+    if not text and not segments:
+        return None
+
+    return TranscriptTranslationResult(
+        target_language=target_language,
+        target_language_label=get_translation_language_label(target_language),
+        text=text or _resolve_correction_text(text=None, segments=segments, language_code=target_language),
+        segments=segments,
+    )
+
+
+def _resolve_translation_result(upload: UploadRecord, target_language: TranslationLanguage) -> TranscriptTranslationResult:
+    overridden_translation = _get_translation_override(upload, target_language)
+    if overridden_translation is not None:
+        return overridden_translation
+
+    try:
+        translated_text, translated_segments = translate_transcript(
+            upload.transcript_text or "",
+            upload.transcript_segments,
+            target_language,
+            upload.detected_language,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except TranslationServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    return TranscriptTranslationResult(
+        target_language=target_language,
+        target_language_label=get_translation_language_label(target_language),
+        text=translated_text,
+        segments=translated_segments,
+    )
 
 
 def _cleanup_duplicate_url_uploads(db: Session, records: list[UploadRecord]) -> list[UploadRecord]:

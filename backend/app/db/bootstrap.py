@@ -18,6 +18,7 @@ SCHEMA_PATCHES = [
     "UPDATE upload_records SET source_type = 'audio' WHERE source_type NOT IN ('audio', 'video', 'subtitle')",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS error_message TEXT",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS transcript_segments JSONB",
+    "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS translation_overrides JSONB",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(30)",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS progress_percent INTEGER DEFAULT 0 NOT NULL",
     "UPDATE upload_records SET processing_stage = CASE WHEN status = 'completed' THEN 'completed' WHEN status = 'failed' THEN 'failed' WHEN source_url IS NOT NULL THEN 'queued' ELSE 'extracting_audio' END WHERE processing_stage IS NULL",
