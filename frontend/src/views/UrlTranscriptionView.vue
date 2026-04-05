@@ -20,6 +20,7 @@ const deletingRecordId = ref<number | null>(null)
 const currentTime = ref(0)
 const activeSegmentIndex = ref(-1)
 const mediaElement = ref<HTMLMediaElement | null>(null)
+const segmentListElement = ref<HTMLElement | null>(null)
 const MESSAGE_TIMEOUT_MS = 4000
 const recordStatusMap = new Map<number, string>()
 const segmentElementMap = new Map<number, HTMLElement>()
@@ -351,6 +352,15 @@ function setSegmentElement(index: number, element: Element | { $el?: Element | n
   segmentElementMap.delete(index)
 }
 
+function captureSegmentListElement(element: Element | { $el?: Element | null } | null) {
+  const resolvedElement = element instanceof HTMLElement
+    ? element
+    : element && '$el' in element && element.$el instanceof HTMLElement
+      ? element.$el
+      : null
+  segmentListElement.value = resolvedElement
+}
+
 function resolveActiveSegmentIndex(segments: TranscriptSegment[], time: number) {
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     if (time >= segments[index].start) {
@@ -459,7 +469,14 @@ watch(activeSegmentIndex, async (index) => {
     return
   }
   await nextTick()
-  segmentElementMap.get(index)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  const segmentElement = segmentElementMap.get(index)
+  const listElement = segmentListElement.value
+  if (!segmentElement || !listElement) {
+    return
+  }
+
+  const targetTop = Math.max(0, segmentElement.offsetTop - listElement.offsetTop - 8)
+  listElement.scrollTo({ top: targetTop, behavior: 'smooth' })
 })
 
 onMounted(() => {
@@ -579,7 +596,7 @@ onUnmounted(() => {
             <span>{{ selectedProgressPercent }}%</span>
           </div>
         </div>
-        <div v-if="selectedSegments.length" class="segment-list">
+        <div v-if="selectedSegments.length" :ref="captureSegmentListElement" class="segment-list">
           <button
             v-for="(segment, index) in selectedSegments"
             :key="`${selectedRecord?.id}-${index}`"

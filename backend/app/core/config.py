@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     whisper_japanese_initial_prompt: str = "これは日本語の音声です。人名や専門用語を含めて、自然な日本語として正確に書き起こしてください。"
     japanese_tts_dictionary_path: str = "app/data/japanese_tts_dictionary.json"
     japanese_transcript_corrections_path: str = "app/data/japanese_transcript_corrections.json"
+    youtube_cookies_path: str | None = None
     default_admin_username: str = "admin"
     default_admin_password: str = "admin123456"
     default_max_upload_size_mb: int = 100
@@ -61,6 +62,16 @@ class Settings(BaseSettings):
         if configured_path.is_absolute():
             return configured_path
         return Path(__file__).resolve().parents[2] / configured_path
+
+    @property
+    def youtube_cookies_file(self) -> Path | None:
+        configured_path = (self.youtube_cookies_path or "").strip()
+        if not configured_path:
+            return None
+        path = Path(configured_path)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parents[2] / path
 
 
 settings = Settings()

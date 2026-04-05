@@ -45,6 +45,9 @@ frontend/  Vue 3 + Vite
 3. 已安装 Node.js 20 或更高版本。
 4. 首次转写时需要联网下载 Whisper 模型。
 5. 使用 URL 解析转写时，需要目标站点可被 `yt-dlp` 正常访问和下载。
+6. 若部分 YouTube 链接触发人机验证，后端会自动尝试读取本机 Edge、Chrome、Brave、Firefox 的浏览器 Cookie 进行回退下载。
+7. 在 Windows 上如果 Chromium 浏览器触发 DPAPI 解密失败，可在 `backend/.env` 中配置 `YOUTUBE_COOKIES_PATH` 指向手工导出的 YouTube `cookies.txt`。
+8. YouTube 新版 JS challenge 需要 `yt-dlp-ejs` 与 Node.js runtime 配合；按 `backend/requirements.txt` 安装依赖后即可满足，部署环境不要省略 Node.js。
 
 ## PostgreSQL 准备
 
@@ -63,6 +66,7 @@ DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/speech_to_tex
 DATABASE_SCHEMA=speech_app
 PREFERRED_ZH_VOICE=zh-CN-XiaoxiaoNeural
 PREFERRED_JA_VOICE=ja-JP-NanamiNeural
+YOUTUBE_COOKIES_PATH=
 ```
 
 ## 后端启动
@@ -70,6 +74,7 @@ PREFERRED_JA_VOICE=ja-JP-NanamiNeural
 在 `backend` 目录执行：
 
 ```powershell
+cd backend
 python -m venv ..\.venv
 ..\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -112,9 +117,11 @@ npm run dev
 4. 在 URL 转写页面输入视频或音频链接，系统会解析媒体、展示播放器，并在播放时同步高亮文本片段。
 5. URL 转写完成后可切换翻译语言、删除最近履历，也可以点击某个时间片段快速跳转播放位置。
 6. 下载 URL 文本时会跟随翻译开关，按需附带翻译结果导出。
-7. 在文本生成语音页面输入文本或上传文档，选择风格和输出格式后生成语音，可试听、下载、删除。
-8. 在下方历史记录中查看状态、错误、批次号，并执行下载、重试、删除。
-9. 管理员进入管理区域管理用户权限、调整最大上传大小并查看审计日志。
+7. 如果 YouTube 仍提示需要登录验证，请先在本机浏览器中登录 YouTube，必要时关闭浏览器后再重新提交链接；如果是 Windows 下 Chromium 的 DPAPI 解密失败，建议改用 Firefox 登录态或配置 `YOUTUBE_COOKIES_PATH`。
+8. 如果 YouTube 链接在已配置 Cookie 的情况下仍报 JS challenge 相关错误，请确认部署机器已安装 Node.js 20+，并重新执行一次 `pip install -r backend/requirements.txt`。
+9. 在文本生成语音页面输入文本或上传文档，选择风格和输出格式后生成语音，可试听、下载、删除。
+10. 在下方历史记录中查看状态、错误、批次号，并执行下载、重试、删除。
+11. 管理员进入管理区域管理用户权限、调整最大上传大小并查看审计日志。
 
 ## 接口概览
 

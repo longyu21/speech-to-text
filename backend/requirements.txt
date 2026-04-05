@@ -15,5 +15,6 @@ langdetect==1.0.9
 pyttsx3==2.99
 imageio-ffmpeg==0.6.0
 pykakasi==2.3.0
-yt-dlp==2025.3.31
+yt-dlp==2026.3.17
+yt-dlp-ejs==0.8.0
 deep-translator==1.11.4

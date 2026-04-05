@@ -58,7 +58,7 @@ button {
 }
 
 .app-shell {
-  width: min(1180px, calc(100% - 32px));
+  width: min(1320px, calc(100% - 32px));
   margin: 0 auto;
   padding: 24px 0 40px;
 }
@@ -369,7 +369,7 @@ textarea {
 }
 
 .url-workspace-grid {
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  grid-template-columns: minmax(0, 1.22fr) minmax(0, 1fr);
   align-items: start;
 }
 
@@ -440,6 +440,7 @@ textarea {
   max-height: 520px;
   overflow: auto;
   padding-right: 6px;
+  scroll-padding-top: 8px;
 }
 
 .segment-card {

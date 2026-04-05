@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -9,7 +10,12 @@ from uuid import uuid4
 from imageio_ffmpeg import get_ffmpeg_exe
 from yt_dlp import DownloadError, YoutubeDL
 
+from app.core.config import settings
 from app.services.media_service import detect_media_source_type, is_supported_transcription_extension
+
+
+YOUTUBE_HOST_KEYWORDS = ("youtube.com", "youtu.be")
+COOKIE_BROWSER_CANDIDATES = ("firefox", "edge", "chrome", "brave")
 
 
 @dataclass(slots=True)
@@ -91,15 +97,23 @@ def download_remote_media(
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [handle_progress],
+        "js_runtimes": {"node": {}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+        },
     }
 
     try:
         emit_progress("resolving_url", 10)
-        with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=True)
-            downloaded_path = _resolve_downloaded_file_path(info)
-    except DownloadError as exc:
-        raise ValueError(str(exc)) from exc
+        info, downloaded_path = _download_with_fallback(url, options)
+    except Exception as exc:
+        raise ValueError(_normalize_remote_download_error(url, exc)) from exc
 
     if not downloaded_path.exists():
         raise ValueError("Downloaded media file could not be located")
@@ -138,3 +152,87 @@ def _resolve_downloaded_file_path(info: dict[str, object]) -> Path:
             return Path(str(value))
 
     raise ValueError("Unable to resolve downloaded media path")
+
+
+def _download_with_fallback(url: str, base_options: dict[str, object]) -> tuple[dict[str, object], Path]:
+    errors: list[str] = []
+    ignored_cookie_errors: list[str] = []
+    for strategy in _build_download_strategies(url, base_options):
+        try:
+            with YoutubeDL(strategy) as downloader:
+                info = downloader.extract_info(url, download=True)
+                return info, _resolve_downloaded_file_path(info)
+        except Exception as exc:
+            message = str(exc).strip()
+            if _is_ignorable_cookie_error(message):
+                ignored_cookie_errors.append(message)
+                continue
+            errors.append(message)
+            continue
+
+    if errors:
+        raise DownloadError(errors[-1])
+    if ignored_cookie_errors:
+        raise DownloadError(ignored_cookie_errors[-1])
+    raise DownloadError("Remote media download failed")
+
+
+def _build_download_strategies(url: str, base_options: dict[str, object]) -> list[dict[str, object]]:
+    strategies: list[dict[str, object]] = []
+    if not _is_youtube_url(url):
+        return [deepcopy(base_options)]
+
+    cookie_file = settings.youtube_cookies_file
+    if cookie_file is not None and cookie_file.exists():
+        strategy = deepcopy(base_options)
+        strategy["cookiefile"] = str(cookie_file)
+        strategies.append(strategy)
+
+    strategies.append(deepcopy(base_options))
+
+    for browser_name in COOKIE_BROWSER_CANDIDATES:
+        strategy = deepcopy(base_options)
+        strategy["cookiesfrombrowser"] = (browser_name,)
+        strategies.append(strategy)
+    return strategies
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(keyword in host for keyword in YOUTUBE_HOST_KEYWORDS)
+
+
+def _normalize_remote_download_error(url: str, error: Exception) -> str:
+    message = str(error).strip() or "Remote media download failed"
+    if _is_youtube_url(url) and (
+        "n challenge solving failed" in message
+        or "no supported javascript runtime" in message.lower()
+        or "external js" in message.lower()
+    ):
+        return (
+            "当前环境缺少 YouTube 所需的 JS challenge 求解能力。"
+            "请确认后端环境已安装 Node.js 20+，并重新执行 backend/requirements.txt 中的依赖安装后重试。"
+        )
+    if "Failed to decrypt with DPAPI" in message:
+        return (
+            "无法解密 Chromium 浏览器里的登录 Cookie。请优先使用 Firefox 登录态，"
+            "或在 backend/.env 中配置 YOUTUBE_COOKIES_PATH 指向手工导出的 YouTube cookies.txt 后重试。"
+        )
+    if "Could not copy Chrome cookie database" in message:
+        return (
+            "无法读取 Chrome 的登录 Cookie，通常是因为 Chrome 正在运行并锁定了 Cookie 数据库。"
+            "请先完全关闭 Chrome 后重试，或改用已登录 YouTube 的 Edge/Firefox。"
+        )
+    if _is_youtube_url(url) and "Sign in to confirm you're not a bot" in message:
+        return (
+            "YouTube 当前要求登录态验证。系统已自动尝试读取本机 Edge、Chrome、Brave、Firefox 的登录 Cookie。"
+            "如果仍然失败，请先在这些浏览器中登录 YouTube 后重试，或关闭浏览器后再试一次。"
+        )
+    return message
+
+
+def _is_ignorable_cookie_error(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "could not find" in normalized and "cookies database" in normalized
+    ) or "failed to load cookies" in normalized or "could not copy chrome cookie database" in normalized

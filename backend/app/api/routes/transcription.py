@@ -460,20 +460,22 @@ def _get_upload_with_access(db: Session, upload_id: int, current_user: User) -> 
 
 
 def _cleanup_duplicate_url_uploads(db: Session, records: list[UploadRecord]) -> list[UploadRecord]:
-    terminal_records = [record for record in records if record.source_url and record.status in {"completed", "failed"}]
     grouped_records: dict[tuple[int, str], list[UploadRecord]] = defaultdict(list)
-    for record in terminal_records:
+    for record in records:
+        if not record.source_url:
+            continue
         grouped_records[(record.user_id, record.source_url or "")].append(record)
 
     deleted_any = False
     for grouped in grouped_records.values():
         if len(grouped) < 2:
             continue
-        keeper = max(grouped, key=_get_url_record_merge_priority)
+        active_records = [record for record in grouped if record.status in {"queued", "processing"}]
+        keeper = max(active_records, key=_get_active_url_record_priority) if active_records else max(grouped, key=_get_url_record_merge_priority)
         for duplicate in grouped:
             if duplicate.id == keeper.id:
                 continue
-            if not (keeper.transcript_text or "").strip() and (duplicate.transcript_text or "").strip():
+            if keeper.status not in {"queued", "processing"} and not (keeper.transcript_text or "").strip() and (duplicate.transcript_text or "").strip():
                 keeper.detected_language = duplicate.detected_language
                 keeper.transcript_text = duplicate.transcript_text
                 keeper.transcript_segments = duplicate.transcript_segments
@@ -502,6 +504,14 @@ def _get_url_record_merge_priority(record: UploadRecord) -> tuple[int, int, int,
         2 if record.status == "completed" else 1,
         1 if (record.transcript_text or "").strip() else 0,
         record.progress_percent or 0,
+        int(record.updated_at.timestamp()) if record.updated_at else 0,
+        int(record.created_at.timestamp()) if record.created_at else 0,
+    )
+
+
+def _get_active_url_record_priority(record: UploadRecord) -> tuple[int, int, int]:
+    return (
+        2 if record.status == "processing" else 1,
         int(record.updated_at.timestamp()) if record.updated_at else 0,
         int(record.created_at.timestamp()) if record.created_at else 0,
     )

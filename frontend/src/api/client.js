@@ -256,6 +256,12 @@ function translateApiError(path, detail) {
         if (normalized === 'Unable to resolve downloaded media path') {
             return 'URL 解析失败，下载后的媒体路径不可用。';
         }
+        if (normalized.startsWith('无法解密 Chromium 浏览器里的登录 Cookie。')) {
+            return normalized;
+        }
+        if (normalized.startsWith('YouTube 当前要求登录态验证。')) {
+            return normalized;
+        }
         return `URL 解析失败：${normalized}`;
     }
     if (path.includes('/transcriptions/upload') || path.includes('/transcriptions/batch-upload')) {

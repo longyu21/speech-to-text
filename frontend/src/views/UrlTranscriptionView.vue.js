@@ -16,6 +16,7 @@ const deletingRecordId = ref(null);
 const currentTime = ref(0);
 const activeSegmentIndex = ref(-1);
 const mediaElement = ref(null);
+const segmentListElement = ref(null);
 const MESSAGE_TIMEOUT_MS = 4000;
 const recordStatusMap = new Map();
 const segmentElementMap = new Map();
@@ -326,6 +327,14 @@ function setSegmentElement(index, element) {
     }
     segmentElementMap.delete(index);
 }
+function captureSegmentListElement(element) {
+    const resolvedElement = element instanceof HTMLElement
+        ? element
+        : element && '$el' in element && element.$el instanceof HTMLElement
+            ? element.$el
+            : null;
+    segmentListElement.value = resolvedElement;
+}
 function resolveActiveSegmentIndex(segments, time) {
     for (let index = segments.length - 1; index >= 0; index -= 1) {
         if (time >= segments[index].start) {
@@ -425,7 +434,13 @@ watch(activeSegmentIndex, async (index) => {
         return;
     }
     await nextTick();
-    segmentElementMap.get(index)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    const segmentElement = segmentElementMap.get(index);
+    const listElement = segmentListElement.value;
+    if (!segmentElement || !listElement) {
+        return;
+    }
+    const targetTop = Math.max(0, segmentElement.offsetTop - listElement.offsetTop - 8);
+    listElement.scrollTo({ top: targetTop, behavior: 'smooth' });
 });
 onMounted(() => {
     loadRecords().catch((error) => {
@@ -685,6 +700,7 @@ if (__VLS_ctx.selectedRecord) {
 }
 if (__VLS_ctx.selectedSegments.length) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ref: (__VLS_ctx.captureSegmentListElement),
         ...{ class: "segment-list" },
     });
     for (const [segment, index] of __VLS_getVForSourceType((__VLS_ctx.selectedSegments))) {
@@ -977,6 +993,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             handleSelect: handleSelect,
             handleDelete: handleDelete,
             setSegmentElement: setSegmentElement,
+            captureSegmentListElement: captureSegmentListElement,
             captureMediaElement: captureMediaElement,
             handlePlaybackSync: handlePlaybackSync,
             seekToSegment: seekToSegment,
