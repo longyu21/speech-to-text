@@ -17,21 +17,42 @@ export interface UploadRecord {
   id: number
   original_filename: string
   source_type: string
+  source_url: string | null
   batch_id: string | null
   file_size: number
   detected_language: string | null
   transcript_text: string | null
+  transcript_segments: TranscriptSegment[] | null
   error_message: string | null
   status: string
+  processing_stage: string | null
+  progress_percent: number
   created_at: string
   updated_at: string
   user_id: number
+}
+
+export interface TranscriptSegment {
+  start: number
+  end: number
+  text: string
 }
 
 export interface TranscriptionResult {
   upload: UploadRecord
   language_label: string
   text: string
+  segments: TranscriptSegment[]
+  duplicate_detected: boolean
+}
+
+export type TranslationLanguage = 'zh' | 'ja' | 'en'
+
+export interface TranscriptTranslationResult {
+  target_language: TranslationLanguage
+  target_language_label: string
+  text: string
+  segments: TranscriptSegment[]
 }
 
 export interface BatchTranscriptionAccepted {

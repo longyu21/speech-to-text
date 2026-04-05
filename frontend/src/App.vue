@@ -24,6 +24,7 @@ function handleLogout() {
       </div>
       <nav v-if="authStore.isAuthenticated" class="main-nav">
         <RouterLink to="/">语音转文本</RouterLink>
+        <RouterLink to="/url-transcription">URL 转写</RouterLink>
         <RouterLink to="/speech-generation">文本转语音</RouterLink>
         <RouterLink v-if="authStore.canAccessAdmin" to="/admin">管理区域</RouterLink>
         <span class="user-chip">{{ displayName }}</span>

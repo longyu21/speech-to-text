@@ -90,7 +90,7 @@ async function loadRecords() {
   if (!authStore.token) {
     return
   }
-  const nextRecords = await listUploads(authStore.token)
+  const nextRecords = await listUploads(authStore.token, 'local')
   syncStatusNotifications(nextRecords)
   records.value = nextRecords
   const latest = records.value[0]

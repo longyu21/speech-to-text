@@ -36,8 +36,9 @@ export function register(payload) {
 export function getCurrentUser(token) {
     return request('/auth/me', {}, token);
 }
-export function listUploads(token) {
-    return request('/transcriptions', {}, token);
+export function listUploads(token, sourceScope = 'all') {
+    const query = sourceScope === 'all' ? '' : `?source_scope=${encodeURIComponent(sourceScope)}`;
+    return request(`/transcriptions${query}`, {}, token);
 }
 export function uploadAudio(file, token) {
     const formData = new FormData();
@@ -55,8 +56,22 @@ export function batchUploadAudio(files, token) {
         body: formData,
     }, token);
 }
-export async function downloadTranscript(uploadId, token) {
-    const response = await fetch(`${API_BASE_URL}/transcriptions/${uploadId}/download`, {
+export function createUrlTranscription(url, token) {
+    return request('/transcriptions/url', {
+        method: 'POST',
+        body: JSON.stringify({ url }),
+    }, token);
+}
+export async function downloadTranscript(uploadId, token, options = {}) {
+    const searchParams = new URLSearchParams();
+    if (options.includeTranslation) {
+        searchParams.set('include_translation', 'true');
+        if (options.targetLanguage) {
+            searchParams.set('target_language', options.targetLanguage);
+        }
+    }
+    const query = searchParams.size ? `?${searchParams.toString()}` : '';
+    const response = await fetch(`${API_BASE_URL}/transcriptions/${uploadId}/download${query}`, {
         headers: {
             Authorization: `Bearer ${token}`,
         },
@@ -66,6 +81,33 @@ export async function downloadTranscript(uploadId, token) {
         throw new Error(translateApiError(`/transcriptions/${uploadId}/download`, data.detail || 'Download failed'));
     }
     return buildDownloadPayload(response);
+}
+export function getTranslatedTranscript(uploadId, targetLanguage, token) {
+    return request(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, {}, token);
+}
+export async function downloadTranscriptText(uploadId, token, options = {}) {
+    const searchParams = new URLSearchParams();
+    if (options.includeTranslation) {
+        searchParams.set('include_translation', 'true');
+        if (options.targetLanguage) {
+            searchParams.set('target_language', options.targetLanguage);
+        }
+    }
+    const query = searchParams.size ? `?${searchParams.toString()}` : '';
+    const response = await fetch(`${API_BASE_URL}/transcriptions/${uploadId}/download-text${query}`, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({ detail: 'Text download failed' }));
+        throw new Error(translateApiError(`/transcriptions/${uploadId}/download-text`, data.detail || 'Text download failed'));
+    }
+    return buildDownloadPayload(response);
+}
+export function buildUploadMediaUrl(uploadId, token) {
+    const encodedToken = encodeURIComponent(token);
+    return `${API_BASE_URL}/transcriptions/${uploadId}/media?token=${encodedToken}`;
 }
 export function listUsers(token) {
     return request('/admin/users', {}, token);
@@ -201,6 +243,21 @@ function parseDownloadFilename(contentDisposition) {
 }
 function translateApiError(path, detail) {
     const normalized = detail.trim();
+    if (path.includes('/transcriptions/url')) {
+        if (normalized === 'Downloaded media exceeds configured upload limit') {
+            return 'URL 对应的媒体文件超过系统上传大小限制。';
+        }
+        if (normalized === 'Downloaded media format is not supported for transcription') {
+            return 'URL 解析成功，但下载到的媒体格式当前不支持转写。';
+        }
+        if (normalized === 'Downloaded media file could not be located') {
+            return 'URL 解析失败，未能定位下载后的媒体文件。';
+        }
+        if (normalized === 'Unable to resolve downloaded media path') {
+            return 'URL 解析失败，下载后的媒体路径不可用。';
+        }
+        return `URL 解析失败：${normalized}`;
+    }
     if (path.includes('/transcriptions/upload') || path.includes('/transcriptions/batch-upload')) {
         if (normalized.startsWith('Unsupported media format:')) {
             const fileMatch = normalized.match(/^Unsupported media format:\s*(.+?)(?:\. Supported formats:|$)/);
@@ -249,6 +306,20 @@ function translateApiError(path, detail) {
         }
         if (normalized === 'No files provided') {
             return '未选择任何文件。';
+        }
+    }
+    if (path.includes('/download-text') && normalized === 'Transcript not available') {
+        return '当前记录尚未生成可下载的文本。';
+    }
+    if (path.includes('/download-text') && normalized === 'Target language is required when translation is enabled') {
+        return '启用翻译下载时必须选择目标语言。';
+    }
+    if (path.includes('/translation') || path.includes('/download-text')) {
+        if (normalized === 'Unsupported translation language') {
+            return '当前只支持翻译为中文、日语或英语。';
+        }
+        if (normalized.startsWith('Translation failed:')) {
+            return '翻译服务暂时不可用，请稍后重试。';
         }
     }
     if (path.includes('/speech-generations/generate')) {

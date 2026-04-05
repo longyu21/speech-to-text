@@ -1,19 +1,23 @@
+from collections import defaultdict
 from pathlib import Path
+from mimetypes import guess_type
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import Response
+from typing import Literal
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.security import get_current_user, require_upload_permission
+from app.core.security import get_current_user, require_upload_permission, resolve_user_from_token
 from app.db.seed import MAX_UPLOAD_KEY
 from app.db.session import get_db
 from app.models.setting import Setting
 from app.models.upload import UploadRecord
 from app.models.user import User
-from app.schemas.transcription import BatchTranscriptionAccepted, TranscriptionResult
+from app.schemas.transcription import BatchTranscriptionAccepted, TranscriptTranslationResult, TranscriptionResult, TranslationLanguage, UrlTranscriptionCreate
 from app.schemas.upload import UploadRecordRead
 from app.services.audit_service import write_audit_log
 from app.services.document_service import build_transcript_docx
@@ -25,8 +29,10 @@ from app.services.media_service import (
     is_supported_transcription_extension,
     validate_upload_content,
 )
+from app.services.remote_media_service import build_pending_remote_media
 from app.services.storage_service import remove_upload_file, save_upload_file
 from app.services.text_to_speech_service import detect_supported_language
+from app.services.translation_service import TranslationServiceError, get_translation_language_label, translate_transcript
 
 
 router = APIRouter(prefix="/transcriptions", tags=["transcriptions"])
@@ -40,20 +46,27 @@ def get_max_upload_size_mb(db: Session) -> int:
 
 
 @router.get("", response_model=list[UploadRecordRead])
-def list_uploads(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[UploadRecord]:
+def list_uploads(
+    source_scope: Literal["all", "local", "url"] = Query("all"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[UploadRecord]:
     query = db.query(UploadRecord).order_by(UploadRecord.created_at.desc())
     if not current_user.can_manage_files:
         query = query.filter(UploadRecord.user_id == current_user.id)
-    return query.all()
+    if source_scope == "local":
+        query = query.filter(UploadRecord.source_url.is_(None))
+    elif source_scope == "url":
+        query = query.filter(UploadRecord.source_url.is_not(None))
+    records = query.all()
+    if source_scope == "url":
+        records = _cleanup_duplicate_url_uploads(db, records)
+    return records
 
 
 @router.get("/{upload_id}", response_model=UploadRecordRead)
 def get_upload(upload_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> UploadRecord:
-    upload = db.query(UploadRecord).filter(UploadRecord.id == upload_id).first()
-    if upload is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload record not found")
-    if not current_user.can_manage_files and upload.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    upload = _get_upload_with_access(db, upload_id, current_user)
     return upload
 
 
@@ -78,7 +91,76 @@ async def upload_and_transcribe(
         return TranscriptionResult(upload=upload, language_label="Queued", text="")
 
     language_label = upload.detected_language.upper() if upload.detected_language else "Imported"
-    return TranscriptionResult(upload=upload, language_label=language_label, text=upload.transcript_text or "")
+    return TranscriptionResult(
+        upload=upload,
+        language_label=language_label,
+        text=upload.transcript_text or "",
+        segments=upload.transcript_segments or [],
+    )
+
+
+@router.post("/url", response_model=TranscriptionResult, status_code=status.HTTP_201_CREATED)
+def create_url_transcription(
+    payload: UrlTranscriptionCreate,
+    current_user: User = Depends(require_upload_permission),
+    db: Session = Depends(get_db),
+) -> TranscriptionResult:
+    existing_url_records = (
+        db.query(UploadRecord)
+        .filter(UploadRecord.user_id == current_user.id, UploadRecord.source_url.is_not(None))
+        .order_by(UploadRecord.created_at.desc())
+        .all()
+    )
+    _cleanup_duplicate_url_uploads(db, existing_url_records)
+
+    existing_upload = (
+        db.query(UploadRecord)
+        .filter(
+            UploadRecord.user_id == current_user.id,
+            UploadRecord.source_url == str(payload.url),
+            UploadRecord.source_url.is_not(None),
+            UploadRecord.status.in_(["queued", "processing", "completed"]),
+        )
+        .order_by(UploadRecord.created_at.desc())
+        .first()
+    )
+    if existing_upload is not None:
+        language_label = existing_upload.detected_language.upper() if existing_upload.detected_language else "Queued"
+        return TranscriptionResult(
+            upload=existing_upload,
+            language_label=language_label,
+            text=existing_upload.transcript_text or "",
+            segments=existing_upload.transcript_segments or [],
+            duplicate_detected=True,
+        )
+
+    batch_id = uuid4().hex
+    pending_media = build_pending_remote_media(str(payload.url))
+
+    upload = UploadRecord(
+        original_filename=pending_media.original_filename,
+        stored_filename=f"pending-{uuid4().hex}",
+        source_type=pending_media.source_type,
+        source_url=pending_media.source_url,
+        batch_id=batch_id,
+        file_size=0,
+        status="queued",
+        processing_stage="queued",
+        progress_percent=5,
+        user_id=current_user.id,
+    )
+    db.add(upload)
+    db.commit()
+    db.refresh(upload)
+    write_audit_log(
+        db,
+        action="upload.url_queued",
+        resource_type="upload",
+        resource_id=upload.id,
+        details=f"Queued remote media download from {payload.url}",
+        user=current_user,
+    )
+    return TranscriptionResult(upload=upload, language_label="Queued", text="", segments=[], duplicate_detected=False)
 
 
 @router.post("/batch-upload", response_model=BatchTranscriptionAccepted, status_code=status.HTTP_201_CREATED)
@@ -131,11 +213,15 @@ async def queue_files(db: Session, current_user: User, files: list[UploadFile], 
                 original_filename=filename,
                 stored_filename=stored_filename,
                 source_type="subtitle",
+                source_url=None,
                 batch_id=batch_id,
                 file_size=len(content),
                 status="completed",
                 detected_language=language_code,
                 transcript_text=transcript_text,
+                transcript_segments=None,
+                processing_stage="completed",
+                progress_percent=100,
                 user_id=current_user.id,
             )
             db.add(upload)
@@ -157,9 +243,12 @@ async def queue_files(db: Session, current_user: User, files: list[UploadFile], 
             original_filename=filename,
             stored_filename=stored_filename,
             source_type=source_type,
+            source_url=None,
             batch_id=batch_id,
             file_size=len(content),
             status="queued",
+            processing_stage="queued",
+            progress_percent=10,
             user_id=current_user.id,
         )
         db.add(upload)
@@ -173,22 +262,38 @@ async def queue_files(db: Session, current_user: User, files: list[UploadFile], 
 @router.get("/{upload_id}/download")
 def download_transcript(
     upload_id: int,
+    include_translation: bool = Query(False),
+    target_language: TranslationLanguage | None = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    upload = db.query(UploadRecord).filter(UploadRecord.id == upload_id).first()
-    if upload is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload record not found")
-    if not current_user.can_manage_files and upload.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    upload = _get_upload_with_access(db, upload_id, current_user)
     if not upload.transcript_text:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
 
-    language_label = upload.detected_language or "Unknown"
-    document_bytes = build_transcript_docx(upload.original_filename, language_label, upload.transcript_text)
+    source_label = upload.detected_language.upper() if upload.detected_language else "Unknown"
+    sections = [(f"原文 ({source_label})", upload.transcript_text)]
+    if include_translation:
+        if target_language is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target language is required when translation is enabled")
+        try:
+            translated_text, _ = translate_transcript(
+                upload.transcript_text,
+                upload.transcript_segments,
+                target_language,
+                upload.detected_language,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except TranslationServiceError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        sections.append((f"翻译 ({get_translation_language_label(target_language)})", translated_text))
+
+    document_bytes = build_transcript_docx(upload.original_filename, sections)
     safe_filename = quote(Path(upload.original_filename).stem)
+    filename_suffix = f"-translated-{target_language}" if include_translation and target_language else ""
     headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}.docx"
+        "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}{filename_suffix}.docx"
     }
     return Response(
         content=document_bytes,
@@ -197,23 +302,116 @@ def download_transcript(
     )
 
 
+@router.get("/{upload_id}/download-text")
+def download_transcript_text(
+    upload_id: int,
+    include_translation: bool = Query(False),
+    target_language: TranslationLanguage | None = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    if not upload.transcript_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
+
+    response_text = upload.transcript_text
+    filename_suffix = ""
+    if include_translation:
+        if target_language is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target language is required when translation is enabled")
+        try:
+            translated_text, _ = translate_transcript(
+                upload.transcript_text,
+                upload.transcript_segments,
+                target_language,
+                upload.detected_language,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except TranslationServiceError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+        translated_label = get_translation_language_label(target_language)
+        source_label = upload.detected_language.upper() if upload.detected_language else "AUTO"
+        response_text = "\n\n".join([
+            f"原文 ({source_label})\n{upload.transcript_text}",
+            f"翻译 ({translated_label})\n{translated_text}",
+        ])
+        filename_suffix = f"-translated-{target_language}"
+
+    safe_filename = quote(Path(upload.original_filename).stem)
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}{filename_suffix}.txt"
+    }
+    return Response(content=response_text.encode("utf-8"), media_type="text/plain; charset=utf-8", headers=headers)
+
+
+@router.get("/{upload_id}/translation", response_model=TranscriptTranslationResult)
+def get_transcript_translation(
+    upload_id: int,
+    target_language: TranslationLanguage = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TranscriptTranslationResult:
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    if not upload.transcript_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
+
+    try:
+        translated_text, translated_segments = translate_transcript(
+            upload.transcript_text,
+            upload.transcript_segments,
+            target_language,
+            upload.detected_language,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except TranslationServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    return TranscriptTranslationResult(
+        target_language=target_language,
+        target_language_label=get_translation_language_label(target_language),
+        text=translated_text,
+        segments=translated_segments,
+    )
+
+
+@router.get("/{upload_id}/media")
+def stream_upload_media(
+    upload_id: int,
+    token: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    current_user = resolve_user_from_token(token, db)
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    if upload.source_type not in {"audio", "video"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Media playback is only available for audio or video uploads")
+
+    file_path = settings.upload_path / upload.stored_filename
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
+
+    media_type = guess_type(upload.original_filename)[0] or "application/octet-stream"
+    return FileResponse(path=file_path, media_type=media_type, filename=upload.original_filename)
+
+
 @router.post("/{upload_id}/retry", response_model=UploadRecordRead)
 def retry_upload(
     upload_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UploadRecord:
-    upload = db.query(UploadRecord).filter(UploadRecord.id == upload_id).first()
-    if upload is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload record not found")
-    if not current_user.can_manage_files and upload.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    upload = _get_upload_with_access(db, upload_id, current_user)
     if upload.status not in {"failed", "completed"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only failed or completed tasks can be retried")
 
     upload.status = "queued"
+    upload.processing_stage = "queued"
+    upload.progress_percent = 0
     upload.error_message = None
     upload.transcript_text = None
+    upload.transcript_segments = None
     upload.detected_language = None
     db.commit()
     db.refresh(upload)
@@ -234,11 +432,7 @@ def delete_upload(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    upload = db.query(UploadRecord).filter(UploadRecord.id == upload_id).first()
-    if upload is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload record not found")
-    if not current_user.can_manage_files and upload.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    upload = _get_upload_with_access(db, upload_id, current_user)
 
     file_path = settings.upload_path / upload.stored_filename
     filename = upload.original_filename
@@ -254,3 +448,60 @@ def delete_upload(
         user=current_user,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _get_upload_with_access(db: Session, upload_id: int, current_user: User) -> UploadRecord:
+    upload = db.query(UploadRecord).filter(UploadRecord.id == upload_id).first()
+    if upload is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload record not found")
+    if not current_user.can_manage_files and upload.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    return upload
+
+
+def _cleanup_duplicate_url_uploads(db: Session, records: list[UploadRecord]) -> list[UploadRecord]:
+    terminal_records = [record for record in records if record.source_url and record.status in {"completed", "failed"}]
+    grouped_records: dict[tuple[int, str], list[UploadRecord]] = defaultdict(list)
+    for record in terminal_records:
+        grouped_records[(record.user_id, record.source_url or "")].append(record)
+
+    deleted_any = False
+    for grouped in grouped_records.values():
+        if len(grouped) < 2:
+            continue
+        keeper = max(grouped, key=_get_url_record_merge_priority)
+        for duplicate in grouped:
+            if duplicate.id == keeper.id:
+                continue
+            if not (keeper.transcript_text or "").strip() and (duplicate.transcript_text or "").strip():
+                keeper.detected_language = duplicate.detected_language
+                keeper.transcript_text = duplicate.transcript_text
+                keeper.transcript_segments = duplicate.transcript_segments
+                keeper.error_message = duplicate.error_message
+                keeper.progress_percent = max(keeper.progress_percent or 0, duplicate.progress_percent or 0)
+                keeper.processing_stage = keeper.processing_stage or duplicate.processing_stage
+            duplicate_path = settings.upload_path / duplicate.stored_filename
+            db.delete(duplicate)
+            remove_upload_file(duplicate_path)
+            deleted_any = True
+
+    if deleted_any:
+        db.commit()
+        record_ids = [record.id for record in records]
+        return (
+            db.query(UploadRecord)
+            .filter(UploadRecord.id.in_(record_ids))
+            .order_by(UploadRecord.created_at.desc())
+            .all()
+        )
+    return records
+
+
+def _get_url_record_merge_priority(record: UploadRecord) -> tuple[int, int, int, int, int]:
+    return (
+        2 if record.status == "completed" else 1,
+        1 if (record.transcript_text or "").strip() else 0,
+        record.progress_percent or 0,
+        int(record.updated_at.timestamp()) if record.updated_at else 0,
+        int(record.created_at.timestamp()) if record.created_at else 0,
+    )

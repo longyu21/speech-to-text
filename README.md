@@ -8,6 +8,7 @@
 - 后端：Python、FastAPI、SQLAlchemy
 - 数据库：PostgreSQL（本地连接）
 - 语音识别：faster-whisper
+- URL 媒体解析：yt-dlp
 - 文档导出：python-docx
 
 ## 核心能力
@@ -16,10 +17,13 @@
 - 用户可自行注册账户
 - 自动检测中文、日语、英文语音并生成文本
 - 支持上传常见音频和视频格式，视频会自动抽取音轨后转写
+- 支持输入媒体 URL 解析远程音视频，页面内直接播放并同步高亮转写文本
+- URL 转写支持按需翻译为中文、日语、英语，并可随下载文本一并导出翻译内容
 - 支持单文件和批量文件入队转写
 - 支持队列式异步转写、失败重试和文件删除
 - 下方结果区展示当前转写文本和历史记录
 - 允许下载 `.docx` Word 文档
+- URL 转写结果支持下载 `.txt` 文本
 - 支持文本或文档生成语音，可选 `mp3`、`wav`、`m4a` 下载格式
 - 中文、日语优先语音可通过环境变量配置
 - 管理员可按权限管理用户、文件、设置和审计日志
@@ -40,6 +44,7 @@ frontend/  Vue 3 + Vite
 2. 已安装 Python 3.11 或更高版本。
 3. 已安装 Node.js 20 或更高版本。
 4. 首次转写时需要联网下载 Whisper 模型。
+5. 使用 URL 解析转写时，需要目标站点可被 `yt-dlp` 正常访问和下载。
 
 ## PostgreSQL 准备
 
@@ -92,6 +97,7 @@ uvicorn app.main:app --reload --port 8000
 在 `frontend` 目录执行：
 
 ```powershell
+cd frontend
 npm install
 npm run dev
 ```
@@ -103,9 +109,12 @@ npm run dev
 1. 新用户可先注册，再登录系统。
 2. 在语音转文本上传单个或多个音频或视频文件。
 3. 系统自动将任务放入队列，后台依次识别语言并生成文本。
-4. 在文本生成语音页面输入文本或上传文档，选择风格和输出格式后生成语音，可试听、下载、删除。
-5. 在下方历史记录中查看状态、错误、批次号，并执行下载、重试、删除。
-6. 管理员进入管理区域管理用户权限、调整最大上传大小并查看审计日志。
+4. 在 URL 转写页面输入视频或音频链接，系统会解析媒体、展示播放器，并在播放时同步高亮文本片段。
+5. URL 转写完成后可切换翻译语言、删除最近履历，也可以点击某个时间片段快速跳转播放位置。
+6. 下载 URL 文本时会跟随翻译开关，按需附带翻译结果导出。
+7. 在文本生成语音页面输入文本或上传文档，选择风格和输出格式后生成语音，可试听、下载、删除。
+8. 在下方历史记录中查看状态、错误、批次号，并执行下载、重试、删除。
+9. 管理员进入管理区域管理用户权限、调整最大上传大小并查看审计日志。
 
 ## 接口概览
 
@@ -116,7 +125,11 @@ npm run dev
 - `GET /api/transcriptions/{id}` 查询单条上传记录
 - `POST /api/transcriptions/upload` 单文件入队
 - `POST /api/transcriptions/batch-upload` 批量文件入队
+- `POST /api/transcriptions/url` 根据 URL 解析远程音视频并入队转写
 - `GET /api/transcriptions/{id}/download` 下载 Word 文档
+- `GET /api/transcriptions/{id}/download-text` 下载纯文本转写结果
+- `GET /api/transcriptions/{id}/translation?target_language=zh|ja|en` 获取 URL 转写结果的按需翻译文本
+- `GET /api/transcriptions/{id}/media?token=...` 在页面中播放音视频媒体
 - `POST /api/transcriptions/{id}/retry` 重新入队
 - `DELETE /api/transcriptions/{id}` 删除文件记录和物理文件
 - `GET /api/speech-generations` 查询语音生成记录

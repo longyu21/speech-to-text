@@ -362,6 +362,195 @@ textarea {
   gap: 24px;
 }
 
+.url-page-grid,
+.url-workspace-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.url-workspace-grid {
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  align-items: start;
+}
+
+.url-intake-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.url-intake-row,
+.player-header {
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.media-player {
+  width: 100%;
+  margin-top: 14px;
+  border-radius: 22px;
+  background: #120e09;
+  overflow: hidden;
+  box-shadow: 0 16px 40px rgba(47, 36, 25, 0.18);
+}
+
+.sync-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.progress-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.progress-panel--compact {
+  margin-top: 8px;
+}
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(83, 61, 39, 0.08);
+  overflow: hidden;
+}
+
+.progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(187, 77, 0, 0.95), rgba(255, 157, 53, 0.95));
+  transition: width 0.3s ease;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.segment-list {
+  display: grid;
+  gap: 10px;
+  max-height: 520px;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.segment-card {
+  width: 100%;
+  text-align: left;
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(83, 61, 39, 0.12);
+  background: rgba(255, 255, 255, 0.72);
+  display: grid;
+  gap: 8px;
+}
+
+.segment-card.active {
+  border-color: rgba(187, 77, 0, 0.4);
+  background: linear-gradient(135deg, rgba(255, 233, 205, 0.96), rgba(255, 251, 245, 0.92));
+  box-shadow: 0 12px 32px rgba(187, 77, 0, 0.12);
+}
+
+.segment-time {
+  color: var(--accent);
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 0.92rem;
+}
+
+.segment-text,
+.plain-transcript-box {
+  line-height: 1.8;
+  color: var(--text);
+}
+
+.segment-text-secondary {
+  color: var(--muted);
+  line-height: 1.7;
+  font-size: 0.94rem;
+}
+
+.segment-text-skeleton,
+.transcript-skeleton-line {
+  display: block;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(228, 219, 205, 0.55), rgba(255, 255, 255, 0.92), rgba(228, 219, 205, 0.55));
+  background-size: 200% 100%;
+  animation: skeleton-shift 1.25s linear infinite;
+}
+
+.segment-text-skeleton {
+  height: 18px;
+  width: 72%;
+}
+
+.plain-transcript-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.plain-transcript-box {
+  min-height: 320px;
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(83, 61, 39, 0.12);
+  white-space: pre-wrap;
+}
+
+.plain-transcript-box--secondary {
+  min-height: auto;
+  background: rgba(255, 250, 245, 0.86);
+  color: var(--muted);
+}
+
+.plain-transcript-box--skeleton {
+  display: grid;
+  gap: 12px;
+}
+
+.transcript-skeleton-line {
+  height: 16px;
+  width: 100%;
+}
+
+.transcript-skeleton-line--short {
+  width: 58%;
+}
+
+.source-link {
+  color: var(--primary-dark);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.status-badge--loading {
+  border-color: rgba(187, 77, 0, 0.18);
+  background: rgba(255, 243, 225, 0.9);
+  color: var(--primary-dark);
+}
+
+.danger-button {
+  color: var(--danger);
+  border-color: rgba(180, 35, 24, 0.18);
+}
+
+.selected-row {
+  background: rgba(255, 244, 228, 0.76);
+}
+
+.clamp-text {
+  max-width: 420px;
+  word-break: break-all;
+}
+
 .metric {
   padding: 18px;
   border-radius: 20px;
@@ -375,10 +564,20 @@ textarea {
   font-size: 1.4rem;
 }
 
+@keyframes skeleton-shift {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
 @media (max-width: 900px) {
   .app-header,
   .hero-card,
-  .admin-grid {
+  .admin-grid,
+  .url-workspace-grid {
     grid-template-columns: 1fr;
     display: grid;
   }
@@ -397,5 +596,9 @@ textarea {
 
   .dropzone {
     padding: 24px;
+  }
+
+  .url-intake-row {
+    flex-direction: column;
   }
 }
