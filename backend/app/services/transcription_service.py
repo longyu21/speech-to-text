@@ -51,6 +51,7 @@ def transcribe_file(
             prepared_media_path,
             model_size,
             duration_seconds=duration_seconds,
+            stage_callback=stage_callback,
             partial_callback=partial_callback,
         )
         language_label = LANGUAGE_LABELS.get(language_code, language_code.upper())
@@ -65,6 +66,7 @@ def _transcribe_with_best_strategy(
     model_size: str,
     *,
     duration_seconds: float,
+    stage_callback: StageCallback | None,
     partial_callback: PartialTranscriptCallback | None,
 ) -> tuple[str, str, list[TranscriptSegment]]:
     base_model = get_model(model_size)
@@ -88,11 +90,21 @@ def _transcribe_with_best_strategy(
     if detected_language != "ja":
         return detected_language, transcript_text, normalized_segments
 
+    if _should_skip_japanese_refinement(duration_seconds):
+        corrected_segments = _apply_japanese_corrections_to_segments(normalized_segments)
+        corrected_text = _join_segment_texts(corrected_segments, "ja")
+        if partial_callback is not None and corrected_text:
+            partial_callback("ja", corrected_text, list(corrected_segments), 98)
+        return "ja", corrected_text or transcript_text, corrected_segments or normalized_segments
+
+    if stage_callback is not None:
+        stage_callback("refining_japanese", 93)
+
     japanese_model = get_model(settings.whisper_japanese_model_size or model_size)
     japanese_segments, japanese_info = japanese_model.transcribe(
         str(file_path),
         language="ja",
-        beam_size=max(settings.whisper_japanese_beam_size, 5),
+        beam_size=max(settings.whisper_japanese_beam_size, 3),
         vad_filter=True,
         condition_on_previous_text=True,
         temperature=[0.0, 0.2],
@@ -103,7 +115,7 @@ def _transcribe_with_best_strategy(
         "ja",
         duration_seconds=duration_seconds,
         partial_callback=partial_callback,
-        progress_start=86,
+        progress_start=93,
         progress_end=98,
         apply_japanese_corrections=True,
     )
@@ -166,6 +178,22 @@ def _normalize_segments(
     return normalized_segments
 
 
+def _apply_japanese_corrections_to_segments(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    corrected_segments: list[TranscriptSegment] = []
+    for segment in segments:
+        corrected_text = _apply_japanese_transcript_corrections(segment["text"])
+        if not corrected_text:
+            continue
+        corrected_segments.append(
+            {
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": corrected_text,
+            }
+        )
+    return corrected_segments
+
+
 def _normalize_segment(
     segment: object,
     language_code: str,
@@ -222,6 +250,13 @@ def _calculate_transcription_progress(segment_end: float, duration_seconds: floa
         return progress_start
     ratio = max(0.0, min(1.0, segment_end / duration_seconds))
     return int(round(progress_start + (progress_end - progress_start) * ratio))
+
+
+def _should_skip_japanese_refinement(duration_seconds: float) -> bool:
+    max_duration_seconds = max(0, int(settings.whisper_japanese_refine_max_duration_seconds))
+    if max_duration_seconds <= 0:
+        return False
+    return duration_seconds > max_duration_seconds
 
 
 def _get_wav_duration_seconds(file_path: Path) -> float:

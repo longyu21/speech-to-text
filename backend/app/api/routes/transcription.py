@@ -122,7 +122,7 @@ def create_url_transcription(
             UploadRecord.user_id == current_user.id,
             UploadRecord.source_url == str(payload.url),
             UploadRecord.source_url.is_not(None),
-            UploadRecord.status.in_(["queued", "processing", "completed"]),
+            UploadRecord.status.in_(["queued", "processing", "paused", "completed"]),
         )
         .order_by(UploadRecord.created_at.desc())
         .first()
@@ -420,8 +420,8 @@ def retry_upload(
     db: Session = Depends(get_db),
 ) -> UploadRecord:
     upload = _get_upload_with_access(db, upload_id, current_user)
-    if upload.status not in {"failed", "completed"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only failed or completed tasks can be retried")
+    if upload.status not in {"failed", "paused", "completed"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only failed, paused, or completed tasks can be retried")
 
     upload.status = "queued"
     upload.processing_stage = "queued"
@@ -571,12 +571,12 @@ def _cleanup_duplicate_url_uploads(db: Session, records: list[UploadRecord]) -> 
     for grouped in grouped_records.values():
         if len(grouped) < 2:
             continue
-        active_records = [record for record in grouped if record.status in {"queued", "processing"}]
+        active_records = [record for record in grouped if record.status in {"queued", "processing", "paused"}]
         keeper = max(active_records, key=_get_active_url_record_priority) if active_records else max(grouped, key=_get_url_record_merge_priority)
         for duplicate in grouped:
             if duplicate.id == keeper.id:
                 continue
-            if keeper.status not in {"queued", "processing"} and not (keeper.transcript_text or "").strip() and (duplicate.transcript_text or "").strip():
+            if keeper.status not in {"queued", "processing", "paused"} and not (keeper.transcript_text or "").strip() and (duplicate.transcript_text or "").strip():
                 keeper.detected_language = duplicate.detected_language
                 keeper.transcript_text = duplicate.transcript_text
                 keeper.transcript_segments = duplicate.transcript_segments
@@ -612,7 +612,7 @@ def _get_url_record_merge_priority(record: UploadRecord) -> tuple[int, int, int,
 
 def _get_active_url_record_priority(record: UploadRecord) -> tuple[int, int, int]:
     return (
-        2 if record.status == "processing" else 1,
+        3 if record.status == "processing" else 2 if record.status == "queued" else 1,
         int(record.updated_at.timestamp()) if record.updated_at else 0,
         int(record.created_at.timestamp()) if record.created_at else 0,
     )

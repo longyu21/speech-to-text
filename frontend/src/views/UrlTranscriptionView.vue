@@ -46,10 +46,12 @@ const downloadFormatOptions = [
 
 const progressLabels: Record<string, string> = {
   queued: '等待处理',
+  paused: '已暂停',
   resolving_url: '解析链接',
   downloading_media: '下载媒体',
   extracting_audio: '提取音轨',
   transcribing: '正在识别语音',
+  refining_japanese: '日语精修中',
   completed: '已完成',
   failed: '处理失败',
 }
@@ -97,6 +99,9 @@ const selectedPersistentNotice = computed(() => {
   if (!selectedRecord.value) {
     return ''
   }
+  if (selectedRecord.value.status === 'paused') {
+    return '该 URL 任务在服务重启后已暂停，点击“重试”后才会继续处理。'
+  }
   if (selectedRecord.value.status === 'queued') {
     return `任务已入队，当前阶段：${formatProgressStage(selectedRecord.value)}。`
   }
@@ -125,7 +130,7 @@ const canPreviewSelectedMedia = computed(() => {
   if (selectedRecord.value.source_type !== 'audio' && selectedRecord.value.source_type !== 'video') {
     return false
   }
-  return ['extracting_audio', 'transcribing', 'completed', 'failed'].includes(selectedRecord.value.processing_stage || '')
+  return ['extracting_audio', 'transcribing', 'paused', 'completed', 'failed'].includes(selectedRecord.value.processing_stage || '')
 })
 const selectedProgressPercent = computed(() => normalizeProgressPercent(selectedRecord.value?.progress_percent ?? 0, selectedRecord.value?.status ?? 'queued'))
 const editingTranslation = computed(() => transcriptEditMode.value && translationEnabled.value)
@@ -206,6 +211,11 @@ function syncStatusNotifications(nextRecords: UploadRecord[]) {
 
     if (record.status === 'completed') {
       nextNotice = `${describeSource(record)} 转写完成`
+      return
+    }
+
+    if (record.status === 'paused') {
+      nextNotice = `${describeSource(record)} 已暂停，点击重试后继续处理`
       return
     }
 
@@ -290,7 +300,7 @@ async function handleSubmit() {
     selectedId.value = result.upload.id
     notice.value = result.duplicate_detected
       ? '相同链接已有任务，已为你定位到现有记录。'
-      : 'URL 媒体已解析完成，任务已入队转写。'
+      : 'URL 媒体已解析完成，任务已入队转写。若服务重启，任务会自动暂停，需手动点重试继续。'
     urlInput.value = ''
     await loadRecords()
   } catch (error) {
@@ -813,7 +823,7 @@ onUnmounted(() => {
 
     <section class="panel">
       <p class="eyebrow">History</p>
-      <h2>最近 URL 任务</h2>
+      <h2>生成履历</h2>
       <div class="table-wrap">
         <table class="record-list" v-if="urlRecords.length">
           <thead>

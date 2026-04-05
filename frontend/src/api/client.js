@@ -276,6 +276,12 @@ function translateApiError(path, detail) {
         }
         return `URL 解析失败：${normalized}`;
     }
+    if (path.includes('/transcriptions/') && path.endsWith('/retry')) {
+        if (normalized === 'Only failed, paused, or completed tasks can be retried') {
+            return '仅失败、已暂停或已完成的任务支持重试。';
+        }
+        return `任务重试失败：${normalized}`;
+    }
     if (path.includes('/transcriptions/') && path.endsWith('/text')) {
         if (normalized === 'Only completed transcripts can be edited') {
             return '仅已完成的转写记录支持文本修正。';

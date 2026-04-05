@@ -21,11 +21,12 @@ SCHEMA_PATCHES = [
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS translation_overrides JSONB",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS processing_stage VARCHAR(30)",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS progress_percent INTEGER DEFAULT 0 NOT NULL",
-    "UPDATE upload_records SET processing_stage = CASE WHEN status = 'completed' THEN 'completed' WHEN status = 'failed' THEN 'failed' WHEN source_url IS NOT NULL THEN 'queued' ELSE 'extracting_audio' END WHERE processing_stage IS NULL",
+    "UPDATE upload_records SET processing_stage = CASE WHEN status = 'completed' THEN 'completed' WHEN status = 'failed' THEN 'failed' WHEN status = 'paused' THEN 'paused' WHEN source_url IS NOT NULL THEN 'queued' ELSE 'extracting_audio' END WHERE processing_stage IS NULL",
     "UPDATE upload_records SET progress_percent = CASE WHEN status = 'completed' THEN 100 WHEN status = 'failed' THEN 100 WHEN status = 'processing' THEN 65 ELSE 0 END WHERE progress_percent IS NULL OR progress_percent = 0",
     "ALTER TABLE IF EXISTS upload_records ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL",
     "ALTER TABLE IF EXISTS upload_records ALTER COLUMN status SET DEFAULT 'queued'",
-    "UPDATE upload_records SET status = 'queued' WHERE status = 'processing'",
+    "UPDATE upload_records SET status = CASE WHEN source_url IS NOT NULL THEN 'paused' ELSE 'queued' END WHERE status = 'processing'",
+    "UPDATE upload_records SET processing_stage = 'paused' WHERE source_url IS NOT NULL AND status = 'paused'",
 ]
 
 

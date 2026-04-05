@@ -18,10 +18,34 @@ class QueueService:
         self._stop_event = asyncio.Event()
 
     def start(self) -> None:
+        self._recover_startup_uploads()
         if self._local_task is None or self._local_task.done() or self._url_task is None or self._url_task.done():
             self._stop_event = asyncio.Event()
             self._local_task = asyncio.create_task(self._worker_loop(process_url_tasks=False))
             self._url_task = asyncio.create_task(self._worker_loop(process_url_tasks=True))
+
+    def _recover_startup_uploads(self) -> None:
+        with SessionLocal() as db:
+            uploads = db.query(UploadRecord).filter(UploadRecord.status.in_(["queued", "processing"])).all()
+            changed = False
+            for upload in uploads:
+                if upload.source_url:
+                    upload.status = "paused"
+                    upload.processing_stage = "paused"
+                    upload.error_message = None
+                    if upload.progress_percent <= 0:
+                        upload.progress_percent = 5
+                    changed = True
+                    continue
+                if upload.status == "processing":
+                    upload.status = "queued"
+                    upload.processing_stage = "queued"
+                    upload.error_message = None
+                    if upload.progress_percent <= 0:
+                        upload.progress_percent = 10
+                    changed = True
+            if changed:
+                db.commit()
 
     async def stop(self) -> None:
         self._stop_event.set()

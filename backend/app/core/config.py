@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     preferred_ja_voice: str | None = None
     whisper_model_size: str = "small"
     whisper_japanese_model_size: str = "medium"
-    whisper_japanese_beam_size: int = 8
+    whisper_japanese_beam_size: int = 5
+    whisper_japanese_refine_max_duration_seconds: int = 900
     whisper_japanese_initial_prompt: str = "これは日本語の音声です。人名や専門用語を含めて、自然な日本語として正確に書き起こしてください。"
     japanese_tts_dictionary_path: str = "app/data/japanese_tts_dictionary.json"
     japanese_transcript_corrections_path: str = "app/data/japanese_transcript_corrections.json"
