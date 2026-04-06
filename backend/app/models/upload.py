@@ -20,6 +20,7 @@ class UploadRecord(Base):
     detected_language: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     transcript_segments: Mapped[Optional[list[dict[str, object]]]] = mapped_column(JSON, nullable=True)
+    translation_jobs: Mapped[Optional[dict[str, dict[str, object]]]] = mapped_column(JSON, nullable=True)
     translation_overrides: Mapped[Optional[dict[str, dict[str, object]]]] = mapped_column(JSON, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="queued")

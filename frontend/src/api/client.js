@@ -82,8 +82,18 @@ export async function downloadTranscript(uploadId, token, options = {}) {
     }
     return buildDownloadPayload(response);
 }
-export function getTranslatedTranscript(uploadId, targetLanguage, token) {
-    return request(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, {}, token);
+export function getTranslatedTranscript(uploadId, targetLanguage, token, signal) {
+    return request(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, { signal }, token);
+}
+export function startTranscriptTranslation(uploadId, targetLanguage, token) {
+    return request(`/transcriptions/${uploadId}/translation?target_language=${encodeURIComponent(targetLanguage)}`, {
+        method: 'POST',
+    }, token);
+}
+export function pauseTranscriptTranslation(uploadId, targetLanguage, token) {
+    return request(`/transcriptions/${uploadId}/translation/pause?target_language=${encodeURIComponent(targetLanguage)}`, {
+        method: 'POST',
+    }, token);
 }
 export function updateTranscriptCorrection(uploadId, payload, token) {
     return request(`/transcriptions/${uploadId}/text`, {
@@ -250,6 +260,12 @@ function parseDownloadFilename(contentDisposition) {
 function translateApiError(path, detail) {
     const normalized = detail.trim();
     if (path.includes('/transcriptions/url')) {
+        if (normalized === '文章页里的内嵌 YouTube 媒体解析超时。请优先直接粘贴 YouTube 视频链接重试。') {
+            return normalized;
+        }
+        if (normalized === '远程媒体解析超时，请稍后重试；如果这是文章页链接，建议直接使用内嵌视频的原始播放链接。') {
+            return normalized;
+        }
         if (normalized === 'Downloaded media exceeds configured upload limit') {
             return 'URL 对应的媒体文件超过系统上传大小限制。';
         }
@@ -281,6 +297,21 @@ function translateApiError(path, detail) {
             return '仅失败、已暂停或已完成的任务支持重试。';
         }
         return `任务重试失败：${normalized}`;
+    }
+    if (path.includes('/translation/pause')) {
+        if (normalized === 'Only queued or processing translations can be paused') {
+            return '仅排队中或翻译中的任务可以暂停。';
+        }
+        return `暂停翻译失败：${normalized}`;
+    }
+    if (/\/transcriptions\/\d+\/translation(\?|$)/.test(path) && !path.includes('/translation/pause')) {
+        if (normalized === 'Transcript not available') {
+            return '当前记录还没有可翻译的文本。';
+        }
+        if (normalized === 'Translation is not completed yet') {
+            return '翻译尚未完成，请先等待完成或继续处理。';
+        }
+        return `翻译处理失败：${normalized}`;
     }
     if (path.includes('/transcriptions/') && path.endsWith('/text')) {
         if (normalized === 'Only completed transcripts can be edited') {

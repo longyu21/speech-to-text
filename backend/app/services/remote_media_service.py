@@ -4,10 +4,12 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from imageio_ffmpeg import get_ffmpeg_exe
+import requests
 from yt_dlp import DownloadError, YoutubeDL
 
 from app.core.config import settings
@@ -16,6 +18,11 @@ from app.services.media_service import detect_media_source_type, is_supported_tr
 
 YOUTUBE_HOST_KEYWORDS = ("youtube.com", "youtu.be")
 COOKIE_BROWSER_CANDIDATES = ("firefox", "edge", "chrome", "brave")
+YOUTUBE_EMBED_PATTERNS = (
+    re.compile(r'https://www\.youtube\.com/embed/([^\?"\'\s>]+)[^"\'\s>]*', re.IGNORECASE),
+    re.compile(r'https://www\.youtube\.com/watch\?v=([^&"\'\s>]+)[^"\'\s>]*', re.IGNORECASE),
+    re.compile(r'https://youtu\.be/([^\?"\'\s>]+)[^"\'\s>]*', re.IGNORECASE),
+)
 
 
 @dataclass(slots=True)
@@ -88,6 +95,10 @@ def download_remote_media(
         if status == "finished":
             emit_progress("downloading_media", 50)
 
+    resolved_url = _resolve_embedded_media_url(url)
+    if resolved_url != url:
+        emit_progress("resolving_embedded_media", 16)
+
     options = {
         "format": "bestvideo*[height<=720]+bestaudio/best[height<=720]/bestvideo+bestaudio/best",
         "outtmpl": str(template),
@@ -96,6 +107,10 @@ def download_remote_media(
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "socket_timeout": settings.remote_media_socket_timeout_seconds,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
         "progress_hooks": [handle_progress],
         "js_runtimes": {"node": {}},
         "extractor_args": {
@@ -111,9 +126,9 @@ def download_remote_media(
 
     try:
         emit_progress("resolving_url", 10)
-        info, downloaded_path = _download_with_fallback(url, options)
+        info, downloaded_path = _download_with_fallback(resolved_url, options)
     except Exception as exc:
-        raise ValueError(_normalize_remote_download_error(url, exc)) from exc
+        raise ValueError(_normalize_remote_download_error(url, resolved_url, exc)) from exc
 
     if not downloaded_path.exists():
         raise ValueError("Downloaded media file could not be located")
@@ -137,6 +152,34 @@ def download_remote_media(
         source_type=source_type,
         source_url=url,
     )
+
+
+def _resolve_embedded_media_url(url: str) -> str:
+    if _is_youtube_url(url):
+        return url
+
+    try:
+        response = requests.get(
+            url,
+            timeout=settings.remote_media_page_probe_timeout_seconds,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            },
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return url
+
+    html = response.text or ""
+    for pattern in YOUTUBE_EMBED_PATTERNS:
+        match = pattern.search(html)
+        if not match:
+            continue
+        video_id = str(match.group(1) or "").strip()
+        if not video_id:
+            continue
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
 
 
 def _resolve_downloaded_file_path(info: dict[str, object]) -> Path:
@@ -202,9 +245,10 @@ def _is_youtube_url(url: str) -> bool:
     return any(keyword in host for keyword in YOUTUBE_HOST_KEYWORDS)
 
 
-def _normalize_remote_download_error(url: str, error: Exception) -> str:
+def _normalize_remote_download_error(source_url: str, resolved_url: str, error: Exception) -> str:
     message = str(error).strip() or "Remote media download failed"
-    if _is_youtube_url(url) and (
+    youtube_related = _is_youtube_url(source_url) or _is_youtube_url(resolved_url)
+    if youtube_related and (
         "n challenge solving failed" in message
         or "no supported javascript runtime" in message.lower()
         or "external js" in message.lower()
@@ -223,11 +267,15 @@ def _normalize_remote_download_error(url: str, error: Exception) -> str:
             "无法读取 Chrome 的登录 Cookie，通常是因为 Chrome 正在运行并锁定了 Cookie 数据库。"
             "请先完全关闭 Chrome 后重试，或改用已登录 YouTube 的 Edge/Firefox。"
         )
-    if _is_youtube_url(url) and "Sign in to confirm you're not a bot" in message:
+    if youtube_related and "Sign in to confirm you're not a bot" in message:
         return (
             "YouTube 当前要求登录态验证。系统已自动尝试读取本机 Edge、Chrome、Brave、Firefox 的登录 Cookie。"
             "如果仍然失败，请先在这些浏览器中登录 YouTube 后重试，或关闭浏览器后再试一次。"
         )
+    if isinstance(error, requests.Timeout) or "timed out" in message.lower() or "read timeout" in message.lower():
+        if youtube_related and not _is_youtube_url(source_url):
+            return "文章页里的内嵌 YouTube 媒体解析超时。请优先直接粘贴 YouTube 视频链接重试。"
+        return "远程媒体解析超时，请稍后重试；如果这是文章页链接，建议直接使用内嵌视频的原始播放链接。"
     return message
 
 

@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from app.core.config import settings
 from app.db.seed import MAX_UPLOAD_KEY
@@ -74,15 +75,26 @@ class QueueService:
             if upload is None:
                 return False
 
+            existing_media_path = _resolve_existing_upload_path(upload.stored_filename)
+            resume_segments = _normalize_resume_segments(upload.transcript_segments)
+            resume_offset_seconds = _get_resume_offset_seconds(upload, resume_segments, existing_media_path)
             upload.status = "processing"
-            upload.processing_stage = "resolving_url" if upload.source_url else "extracting_audio"
-            upload.progress_percent = 8 if upload.source_url else 48
+            if upload.source_url and existing_media_path is None:
+                upload.processing_stage = "resolving_url"
+                upload.progress_percent = max(upload.progress_percent or 0, 8)
+            elif resume_offset_seconds > 0:
+                upload.processing_stage = "transcribing"
+                upload.progress_percent = max(upload.progress_percent or 0, 72)
+            else:
+                upload.processing_stage = "extracting_audio"
+                upload.progress_percent = max(upload.progress_percent or 0, 48)
             upload.error_message = None
             db.commit()
             db.refresh(upload)
             upload_id = upload.id
             stored_filename = upload.stored_filename
             source_url = upload.source_url
+            preferred_language = upload.detected_language
             max_upload_setting = db.query(Setting).filter(Setting.key == MAX_UPLOAD_KEY).first()
             max_upload_size_mb = int(max_upload_setting.value) if max_upload_setting is not None else settings.default_max_upload_size_mb
 
@@ -110,8 +122,8 @@ class QueueService:
                 inner_db.commit()
 
         try:
-            file_path = settings.upload_path / stored_filename
-            if source_url:
+            file_path = existing_media_path or (settings.upload_path / stored_filename)
+            if source_url and existing_media_path is None:
                 downloaded_media = await asyncio.to_thread(
                     download_remote_media,
                     source_url,
@@ -134,7 +146,7 @@ class QueueService:
                     upload.progress_percent = 58
                     db.commit()
             else:
-                update_stage("extracting_audio", 58)
+                update_stage("transcribing" if resume_offset_seconds > 0 else "extracting_audio", 72 if resume_offset_seconds > 0 else 58)
 
             language_code, _, transcript_text, transcript_segments = await asyncio.to_thread(
                 transcribe_file,
@@ -142,6 +154,9 @@ class QueueService:
                 settings.whisper_model_size,
                 stage_callback=update_stage,
                 partial_callback=update_partial,
+                resume_from_seconds=resume_offset_seconds,
+                existing_segments=resume_segments if resume_offset_seconds > 0 else None,
+                preferred_language=preferred_language,
             )
             if not transcript_text.strip():
                 raise ValueError("No speech could be recognized from the media")
@@ -175,8 +190,10 @@ class QueueService:
                 upload.processing_stage = "failed"
                 upload.progress_percent = 100
                 upload.error_message = str(exc)
-                upload.transcript_text = None
-                upload.transcript_segments = None
+                has_partial_transcript = bool((upload.transcript_text or "").strip() or (upload.transcript_segments or []))
+                if not source_url or not has_partial_transcript:
+                    upload.transcript_text = None
+                    upload.transcript_segments = None
                 db.commit()
                 write_audit_log(
                     db,
@@ -192,3 +209,46 @@ class QueueService:
 
 
 queue_service = QueueService()
+
+
+def _resolve_existing_upload_path(stored_filename: str) -> Path | None:
+    file_path = settings.upload_path / stored_filename
+    if file_path.exists() and file_path.is_file():
+        return file_path
+    return None
+
+
+def _normalize_resume_segments(segments: list[dict[str, object]] | None) -> list[dict[str, object]]:
+    normalized_segments: list[dict[str, object]] = []
+    for segment in segments or []:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            start = round(float(segment.get("start", 0.0) or 0.0), 2)
+            end = round(float(segment.get("end", 0.0) or 0.0), 2)
+        except (TypeError, ValueError):
+            continue
+        normalized_segments.append(
+            {
+                "start": max(0.0, start),
+                "end": max(max(0.0, start), end),
+                "text": text,
+            }
+        )
+    return normalized_segments
+
+
+def _get_resume_offset_seconds(
+    upload: UploadRecord,
+    resume_segments: list[dict[str, object]],
+    existing_media_path: Path | None,
+) -> float:
+    if upload.source_url is None or existing_media_path is None or not resume_segments:
+        return 0.0
+    if (upload.progress_percent or 0) >= 98:
+        return 0.0
+    try:
+        return max(0.0, round(float(resume_segments[-1].get("end", 0.0) or 0.0), 2))
+    except (TypeError, ValueError):
+        return 0.0

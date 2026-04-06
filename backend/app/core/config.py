@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     japanese_tts_dictionary_path: str = "app/data/japanese_tts_dictionary.json"
     japanese_transcript_corrections_path: str = "app/data/japanese_transcript_corrections.json"
     youtube_cookies_path: str | None = None
+    remote_media_page_probe_timeout_seconds: int = 10
+    remote_media_socket_timeout_seconds: int = 15
     default_admin_username: str = "admin"
     default_admin_password: str = "admin123456"
     default_max_upload_size_mb: int = 100

@@ -41,21 +41,39 @@ def transcribe_file(
     *,
     stage_callback: StageCallback | None = None,
     partial_callback: PartialTranscriptCallback | None = None,
+    resume_from_seconds: float = 0.0,
+    existing_segments: list[TranscriptSegment] | None = None,
+    preferred_language: str | None = None,
 ) -> tuple[str, str, str, list[TranscriptSegment]]:
-    prepared_media_path = prepare_media_for_transcription(file_path)
+    normalized_existing_segments = _normalize_existing_segments(existing_segments)
+    normalized_resume_offset = max(0.0, float(resume_from_seconds or 0.0))
+    prepared_media_path = prepare_media_for_transcription(file_path, start_offset_seconds=normalized_resume_offset)
     try:
         if stage_callback is not None:
             stage_callback("transcribing", 72)
-        duration_seconds = _get_wav_duration_seconds(prepared_media_path)
+        remaining_duration_seconds = _get_wav_duration_seconds(prepared_media_path)
+        duration_seconds = normalized_resume_offset + remaining_duration_seconds if remaining_duration_seconds > 0 else 0.0
+
+        def emit_partial(language_code: str, transcript_text: str, transcript_segments: list[TranscriptSegment], progress_percent: int) -> None:
+            if partial_callback is None:
+                return
+            combined_segments = _merge_resume_segments(normalized_existing_segments, transcript_segments)
+            combined_text = _join_segment_texts(combined_segments, language_code)
+            partial_callback(language_code, combined_text, combined_segments, progress_percent)
+
         language_code, transcript_text, transcript_segments = _transcribe_with_best_strategy(
             prepared_media_path,
             model_size,
             duration_seconds=duration_seconds,
+            time_offset_seconds=normalized_resume_offset,
             stage_callback=stage_callback,
-            partial_callback=partial_callback,
+            partial_callback=emit_partial if partial_callback is not None else None,
+            preferred_language=preferred_language,
         )
+        combined_segments = _merge_resume_segments(normalized_existing_segments, transcript_segments)
+        combined_text = _join_segment_texts(combined_segments, language_code)
         language_label = LANGUAGE_LABELS.get(language_code, language_code.upper())
-        return language_code, language_label, transcript_text, transcript_segments
+        return language_code, language_label, combined_text or transcript_text, combined_segments
     finally:
         if prepared_media_path.exists() and prepared_media_path != file_path:
             prepared_media_path.unlink(missing_ok=True)
@@ -66,22 +84,29 @@ def _transcribe_with_best_strategy(
     model_size: str,
     *,
     duration_seconds: float,
+    time_offset_seconds: float,
     stage_callback: StageCallback | None,
     partial_callback: PartialTranscriptCallback | None,
+    preferred_language: str | None,
 ) -> tuple[str, str, list[TranscriptSegment]]:
     base_model = get_model(model_size)
-    segments, info = base_model.transcribe(
-        str(file_path),
-        beam_size=5,
-        vad_filter=True,
-        condition_on_previous_text=True,
-        temperature=[0.0, 0.2, 0.4],
-    )
-    detected_language = info.language or "unknown"
+    base_transcribe_options = {
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": True,
+        "temperature": [0.0, 0.2, 0.4],
+    }
+    normalized_preferred_language = (preferred_language or "").strip().lower()
+    if normalized_preferred_language in LANGUAGE_LABELS:
+        base_transcribe_options["language"] = normalized_preferred_language
+
+    segments, info = base_model.transcribe(str(file_path), **base_transcribe_options)
+    detected_language = normalized_preferred_language or info.language or "unknown"
     transcript_text, normalized_segments = _collect_transcript_segments(
         segments,
         detected_language,
         duration_seconds=duration_seconds,
+        time_offset_seconds=time_offset_seconds,
         partial_callback=partial_callback,
         progress_start=72,
         progress_end=92,
@@ -114,6 +139,7 @@ def _transcribe_with_best_strategy(
         japanese_segments,
         "ja",
         duration_seconds=duration_seconds,
+        time_offset_seconds=time_offset_seconds,
         partial_callback=partial_callback,
         progress_start=93,
         progress_end=98,
@@ -127,6 +153,7 @@ def _collect_transcript_segments(
     language_code: str,
     *,
     duration_seconds: float,
+    time_offset_seconds: float,
     partial_callback: PartialTranscriptCallback | None,
     progress_start: int,
     progress_end: int,
@@ -137,7 +164,12 @@ def _collect_transcript_segments(
     last_emitted_at = 0.0
 
     for segment in segments:
-        normalized = _normalize_segment(segment, language_code, apply_japanese_corrections=apply_japanese_corrections)
+        normalized = _normalize_segment(
+            segment,
+            language_code,
+            apply_japanese_corrections=apply_japanese_corrections,
+            time_offset_seconds=time_offset_seconds,
+        )
         if normalized is None:
             continue
         normalized_segments.append(normalized)
@@ -199,6 +231,7 @@ def _normalize_segment(
     language_code: str,
     *,
     apply_japanese_corrections: bool = False,
+    time_offset_seconds: float = 0.0,
 ) -> TranscriptSegment | None:
     text = str(getattr(segment, "text", "")).strip()
     if not text:
@@ -211,11 +244,50 @@ def _normalize_segment(
         text = _apply_japanese_transcript_corrections(text)
     if not text:
         return None
+    segment_start = round(float(getattr(segment, "start", 0.0) or 0.0) + time_offset_seconds, 2)
+    segment_end = round(float(getattr(segment, "end", 0.0) or 0.0) + time_offset_seconds, 2)
     return {
-        "start": round(float(getattr(segment, "start", 0.0) or 0.0), 2),
-        "end": round(float(getattr(segment, "end", 0.0) or 0.0), 2),
+        "start": segment_start,
+        "end": max(segment_start, segment_end),
         "text": text,
     }
+
+
+def _normalize_existing_segments(segments: list[TranscriptSegment] | None) -> list[TranscriptSegment]:
+    normalized_segments: list[TranscriptSegment] = []
+    for segment in segments or []:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            start = round(float(segment.get("start", 0.0) or 0.0), 2)
+            end = round(float(segment.get("end", 0.0) or 0.0), 2)
+        except (TypeError, ValueError):
+            continue
+        normalized_segments.append(
+            {
+                "start": max(0.0, start),
+                "end": max(max(0.0, start), end),
+                "text": text,
+            }
+        )
+    return normalized_segments
+
+
+def _merge_resume_segments(existing_segments: list[TranscriptSegment], resumed_segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    if not existing_segments:
+        return list(resumed_segments)
+    if not resumed_segments:
+        return list(existing_segments)
+
+    merged_segments = list(existing_segments)
+    last_existing_end = merged_segments[-1]["end"]
+    for segment in resumed_segments:
+        if segment["end"] <= last_existing_end and merged_segments[-1]["text"] == segment["text"]:
+            continue
+        merged_segments.append(segment)
+        last_existing_end = segment["end"]
+    return merged_segments
 
 
 def _join_segment_texts(segments: list[TranscriptSegment], language_code: str) -> str:

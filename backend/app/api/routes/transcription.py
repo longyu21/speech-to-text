@@ -32,6 +32,7 @@ from app.services.media_service import (
 from app.services.remote_media_service import build_pending_remote_media
 from app.services.storage_service import remove_upload_file, save_upload_file
 from app.services.text_to_speech_service import detect_supported_language
+from app.services.translation_queue_service import translation_queue_service
 from app.services.translation_service import TranslationServiceError, get_translation_language_label, translate_transcript
 
 
@@ -343,6 +344,75 @@ def get_transcript_translation(
     return _resolve_translation_result(upload, target_language)
 
 
+@router.post("/{upload_id}/translation", response_model=UploadRecordRead)
+def start_transcript_translation(
+    upload_id: int,
+    target_language: TranslationLanguage = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadRecord:
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    if upload.status != "completed" or not (upload.transcript_text or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transcript not available")
+
+    translation_jobs = dict(upload.translation_jobs or {})
+    next_job = _normalize_translation_job_state(translation_jobs.get(target_language), target_language)
+    if next_job["status"] == "completed":
+        return upload
+
+    next_job["status"] = "queued"
+    next_job["error_message"] = None
+    next_job["updated_at"] = _utcnow_isoformat()
+    next_job["total_segment_count"] = len(upload.transcript_segments or []) or (1 if (upload.transcript_text or "").strip() else 0)
+    translation_jobs[target_language] = next_job
+    upload.translation_jobs = translation_jobs
+    db.commit()
+    db.refresh(upload)
+
+    translation_queue_service.start_translation(upload.id, target_language)
+    write_audit_log(
+        db,
+        action="upload.translation_started",
+        resource_type="upload",
+        resource_id=upload.id,
+        details=f"Started {target_language} translation for {upload.original_filename}",
+        user=current_user,
+    )
+    return upload
+
+
+@router.post("/{upload_id}/translation/pause", response_model=UploadRecordRead)
+def pause_transcript_translation(
+    upload_id: int,
+    target_language: TranslationLanguage = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadRecord:
+    upload = _get_upload_with_access(db, upload_id, current_user)
+    translation_jobs = dict(upload.translation_jobs or {})
+    current_job = _normalize_translation_job_state(translation_jobs.get(target_language), target_language)
+    if current_job["status"] not in {"queued", "processing"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only queued or processing translations can be paused")
+
+    current_job["status"] = "paused"
+    current_job["updated_at"] = _utcnow_isoformat()
+    translation_jobs[target_language] = current_job
+    upload.translation_jobs = translation_jobs
+    db.commit()
+    db.refresh(upload)
+
+    translation_queue_service.pause_translation(upload.id, target_language)
+    write_audit_log(
+        db,
+        action="upload.translation_paused",
+        resource_type="upload",
+        resource_id=upload.id,
+        details=f"Paused {target_language} translation for {upload.original_filename}",
+        user=current_user,
+    )
+    return upload
+
+
 @router.put("/{upload_id}/text", response_model=UploadRecordRead)
 def update_transcript_text(
     upload_id: int,
@@ -368,10 +438,26 @@ def update_transcript_text(
     if payload.target_language is None:
         upload.transcript_text = normalized_text
         upload.transcript_segments = normalized_segments
+        upload.translation_jobs = None
         upload.translation_overrides = None
         action = "upload.transcript_corrected"
         details = f"Updated transcript text for {upload.original_filename}"
     else:
+        translated_count = len(normalized_segments or []) or (1 if normalized_text else 0)
+        translation_jobs = dict(upload.translation_jobs or {})
+        translation_jobs[payload.target_language] = {
+            "target_language": payload.target_language,
+            "target_language_label": get_translation_language_label(payload.target_language),
+            "status": "completed",
+            "progress_percent": 100,
+            "translated_segment_count": translated_count,
+            "total_segment_count": translated_count,
+            "text": normalized_text,
+            "segments": normalized_segments or [],
+            "error_message": None,
+            "updated_at": _utcnow_isoformat(),
+        }
+        upload.translation_jobs = translation_jobs
         translation_overrides = dict(upload.translation_overrides or {})
         translation_overrides[payload.target_language] = {
             "text": normalized_text,
@@ -423,13 +509,23 @@ def retry_upload(
     if upload.status not in {"failed", "paused", "completed"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only failed, paused, or completed tasks can be retried")
 
+    resume_from_partial = bool(
+        upload.source_url
+        and upload.status in {"failed", "paused"}
+        and ((upload.transcript_text or "").strip() or (upload.transcript_segments or []))
+    )
     upload.status = "queued"
     upload.processing_stage = "queued"
-    upload.progress_percent = 0
     upload.error_message = None
-    upload.transcript_text = None
-    upload.transcript_segments = None
-    upload.detected_language = None
+    if resume_from_partial:
+        upload.progress_percent = max(upload.progress_percent or 0, 5)
+    else:
+        upload.progress_percent = 0
+        upload.transcript_text = None
+        upload.transcript_segments = None
+        upload.translation_jobs = None
+        upload.detected_language = None
+        upload.translation_overrides = None
     db.commit()
     db.refresh(upload)
     write_audit_log(
@@ -437,7 +533,11 @@ def retry_upload(
         action="upload.retried",
         resource_type="upload",
         resource_id=upload.id,
-        details=f"Re-queued file {upload.original_filename}",
+        details=(
+            f"Resumed URL transcription for {upload.original_filename} from last checkpoint"
+            if resume_from_partial
+            else f"Re-queued file {upload.original_filename}"
+        ),
         user=current_user,
     )
     return upload
@@ -535,10 +635,42 @@ def _get_translation_override(upload: UploadRecord, target_language: Translation
     )
 
 
+def _get_completed_translation_job(upload: UploadRecord, target_language: TranslationLanguage) -> TranscriptTranslationResult | None:
+    translation_jobs = upload.translation_jobs or {}
+    current_job = translation_jobs.get(target_language)
+    if not isinstance(current_job, dict):
+        return None
+    if str(current_job.get("status") or "").strip().lower() != "completed":
+        return None
+
+    text = str(current_job.get("text") or "").strip()
+    segments = _normalize_correction_segments(current_job.get("segments")) or []
+    if not text and not segments:
+        return None
+
+    return TranscriptTranslationResult(
+        target_language=target_language,
+        target_language_label=get_translation_language_label(target_language),
+        text=text or _resolve_correction_text(text=None, segments=segments, language_code=target_language),
+        segments=segments,
+    )
+
+
 def _resolve_translation_result(upload: UploadRecord, target_language: TranslationLanguage) -> TranscriptTranslationResult:
     overridden_translation = _get_translation_override(upload, target_language)
     if overridden_translation is not None:
         return overridden_translation
+
+    completed_translation_job = _get_completed_translation_job(upload, target_language)
+    if completed_translation_job is not None:
+        return completed_translation_job
+
+    translation_jobs = upload.translation_jobs or {}
+    current_job = translation_jobs.get(target_language)
+    if isinstance(current_job, dict):
+        current_status = str(current_job.get("status") or "").strip().lower()
+        if current_status in {"queued", "processing", "paused"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Translation is not completed yet")
 
     try:
         translated_text, translated_segments = translate_transcript(
@@ -580,6 +712,7 @@ def _cleanup_duplicate_url_uploads(db: Session, records: list[UploadRecord]) -> 
                 keeper.detected_language = duplicate.detected_language
                 keeper.transcript_text = duplicate.transcript_text
                 keeper.transcript_segments = duplicate.transcript_segments
+                keeper.translation_jobs = duplicate.translation_jobs
                 keeper.error_message = duplicate.error_message
                 keeper.progress_percent = max(keeper.progress_percent or 0, duplicate.progress_percent or 0)
                 keeper.processing_stage = keeper.processing_stage or duplicate.processing_stage
@@ -616,3 +749,23 @@ def _get_active_url_record_priority(record: UploadRecord) -> tuple[int, int, int
         int(record.updated_at.timestamp()) if record.updated_at else 0,
         int(record.created_at.timestamp()) if record.created_at else 0,
     )
+
+
+def _normalize_translation_job_state(entry: object, target_language: TranslationLanguage) -> dict[str, object]:
+    normalized = dict(entry) if isinstance(entry, dict) else {}
+    return {
+        "target_language": target_language,
+        "target_language_label": get_translation_language_label(target_language),
+        "status": str(normalized.get("status") or "idle").strip().lower(),
+        "progress_percent": int(normalized.get("progress_percent") or 0),
+        "translated_segment_count": int(normalized.get("translated_segment_count") or 0),
+        "total_segment_count": int(normalized.get("total_segment_count") or 0),
+        "text": str(normalized.get("text") or "").strip() or None,
+        "segments": _normalize_correction_segments(normalized.get("segments")) or [],
+        "error_message": str(normalized.get("error_message") or "").strip() or None,
+        "updated_at": normalized.get("updated_at"),
+    }
+
+
+def _utcnow_isoformat() -> str:
+    return datetime.utcnow().isoformat()

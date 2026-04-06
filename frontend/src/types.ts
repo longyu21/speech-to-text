@@ -23,6 +23,7 @@ export interface UploadRecord {
   detected_language: string | null
   transcript_text: string | null
   transcript_segments: TranscriptSegment[] | null
+  translation_jobs: Partial<Record<TranslationLanguage, TranslationJobState>> | null
   error_message: string | null
   status: string
   processing_stage: string | null
@@ -36,6 +37,19 @@ export interface TranscriptSegment {
   start: number
   end: number
   text: string
+}
+
+export interface TranslationJobState {
+  target_language: TranslationLanguage
+  target_language_label: string
+  status: string
+  progress_percent: number
+  translated_segment_count: number
+  total_segment_count: number
+  text: string | null
+  segments: TranscriptSegment[]
+  error_message: string | null
+  updated_at: string | null
 }
 
 export interface TranscriptionResult {

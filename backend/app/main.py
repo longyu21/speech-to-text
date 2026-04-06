@@ -11,6 +11,7 @@ from app.db.seed import seed_defaults
 from app.db.session import SessionLocal, engine
 from app.models import Setting, UploadRecord, User
 from app.services.queue_service import queue_service
+from app.services.translation_queue_service import translation_queue_service
 
 
 @asynccontextmanager
@@ -23,8 +24,10 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as session:
         seed_defaults(session)
     queue_service.start()
+    translation_queue_service.start()
     yield
     await queue_service.stop()
+    await translation_queue_service.stop()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

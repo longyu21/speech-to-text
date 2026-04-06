@@ -1,5 +1,5 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, getTranslatedTranscript, listUploads, updateTranscriptCorrection } from '@/api/client';
+import { buildUploadMediaUrl, createUrlTranscription, deleteUpload, downloadTranscript, downloadTranscriptText, listUploads, pauseTranscriptTranslation, retryUpload, startTranscriptTranslation, updateTranscriptCorrection } from '@/api/client';
 import { useAuthStore } from '@/stores/auth';
 const authStore = useAuthStore();
 const urlInput = ref('');
@@ -11,7 +11,7 @@ const errorMessage = ref('');
 const translationEnabled = ref(false);
 const translationLanguage = ref('zh');
 const downloadFormat = ref('txt');
-const translationLoading = ref(false);
+const retryingRecordId = ref(null);
 const deletingRecordId = ref(null);
 const currentTime = ref(0);
 const activeSegmentIndex = ref(-1);
@@ -24,7 +24,6 @@ const transcriptDraftSegments = ref([]);
 const MESSAGE_TIMEOUT_MS = 4000;
 const recordStatusMap = new Map();
 const segmentElementMap = new Map();
-const translationCache = ref({});
 let pollTimer = null;
 let noticeTimer = null;
 let errorTimer = null;
@@ -41,6 +40,7 @@ const progressLabels = {
     queued: '等待处理',
     paused: '已暂停',
     resolving_url: '解析链接',
+    resolving_embedded_media: '解析内嵌媒体',
     downloading_media: '下载媒体',
     extracting_audio: '提取音轨',
     transcribing: '正在识别语音',
@@ -52,28 +52,66 @@ const urlRecords = computed(() => records.value.filter((record) => Boolean(recor
 const selectedRecord = computed(() => urlRecords.value.find((record) => record.id === selectedId.value) ?? urlRecords.value[0] ?? null);
 const selectedSegments = computed(() => selectedRecord.value?.transcript_segments ?? []);
 const selectedHasTranscript = computed(() => Boolean(selectedRecord.value?.transcript_text?.trim()) || selectedSegments.value.length > 0);
-const selectedTranslation = computed(() => {
-    const recordId = selectedRecord.value?.id;
-    if (!recordId || !translationEnabled.value) {
+const selectedTranslationJob = computed(() => {
+    if (!selectedRecord.value || !translationEnabled.value) {
         return null;
     }
-    return translationCache.value[recordId]?.[translationLanguage.value] ?? null;
+    return selectedRecord.value.translation_jobs?.[translationLanguage.value] ?? null;
 });
+const selectedTranslation = computed(() => {
+    const currentJob = selectedTranslationJob.value;
+    if (!currentJob) {
+        return null;
+    }
+    if (!currentJob.text?.trim() && !currentJob.segments.length) {
+        return null;
+    }
+    return {
+        target_language: currentJob.target_language,
+        target_language_label: currentJob.target_language_label,
+        text: currentJob.text ?? '',
+        segments: currentJob.segments ?? [],
+    };
+});
+const translationLoading = computed(() => ['queued', 'processing'].includes(selectedTranslationJob.value?.status ?? ''));
 const translatedSegments = computed(() => selectedTranslation.value?.segments ?? []);
 const translatedTranscriptText = computed(() => selectedTranslation.value?.text ?? '');
 const canTranslateSelected = computed(() => selectedRecord.value?.status === 'completed' && selectedHasTranscript.value);
-const showTranslationSkeleton = computed(() => translationEnabled.value && translationLoading.value && canTranslateSelected.value);
+const showTranslationSkeleton = computed(() => {
+    if (!translationEnabled.value || !translationLoading.value || !canTranslateSelected.value) {
+        return false;
+    }
+    return !translatedSegments.value.length && !translatedTranscriptText.value.trim();
+});
 const translationStatusMessage = computed(() => {
     if (!translationEnabled.value || !canTranslateSelected.value) {
         return '';
     }
-    if (translationLoading.value) {
-        return '正在生成翻译文本，请稍候。';
+    if (translationLoading.value && selectedTranslationJob.value) {
+        const translatedCount = selectedTranslationJob.value.translated_segment_count || 0;
+        const totalCount = selectedTranslationJob.value.total_segment_count || 0;
+        const countMessage = totalCount > 0 ? `，已完成 ${translatedCount}/${totalCount} 段` : '';
+        return `翻译进行中，当前进度 ${selectedTranslationJob.value.progress_percent}%${countMessage}。`;
     }
-    if (selectedTranslation.value) {
+    if (selectedTranslationJob.value?.status === 'paused') {
+        return `翻译已暂停，当前进度 ${selectedTranslationJob.value.progress_percent}%，可继续处理。`;
+    }
+    if (selectedTranslationJob.value?.status === 'failed') {
+        return '翻译失败，可重新继续处理。';
+    }
+    if (selectedTranslation.value && selectedTranslationJob.value?.status === 'completed') {
         return `当前显示 ${selectedTranslation.value.target_language_label} 翻译。`;
     }
     return '';
+});
+const selectedTranslationError = computed(() => {
+    if (!translationEnabled.value) {
+        return '';
+    }
+    if (selectedTranslationJob.value?.status !== 'failed') {
+        return '';
+    }
+    return selectedTranslationJob.value.error_message || '翻译失败，请稍后继续处理。';
 });
 const selectedPersistentError = computed(() => {
     if (!selectedRecord.value) {
@@ -92,7 +130,12 @@ const selectedPersistentNotice = computed(() => {
         return '';
     }
     if (selectedRecord.value.status === 'paused') {
-        return '该 URL 任务在服务重启后已暂停，点击“重试”后才会继续处理。';
+        return hasPartialTranscript(selectedRecord.value)
+            ? '该 URL 任务已暂停，点击“继续重试”后会从上次已完成片段后继续处理。'
+            : '该 URL 任务在服务重启后已暂停，点击“重试”后才会继续处理。';
+    }
+    if (selectedRecord.value.status === 'failed' && hasPartialTranscript(selectedRecord.value)) {
+        return '本次处理已保留失败前的文本片段，点击“继续重试”可从上次失败位置后继续。';
     }
     if (selectedRecord.value.status === 'queued') {
         return `任务已入队，当前阶段：${formatProgressStage(selectedRecord.value)}。`;
@@ -131,7 +174,7 @@ const canEditSelectedText = computed(() => {
         return false;
     }
     if (translationEnabled.value) {
-        return Boolean(selectedTranslation.value);
+        return selectedTranslationJob.value?.status === 'completed' && Boolean(selectedTranslation.value);
     }
     return selectedHasTranscript.value;
 });
@@ -183,6 +226,40 @@ function normalizeProgressPercent(progressPercent, status) {
 function formatProgressStage(record) {
     return progressLabels[record.processing_stage || record.status] || '处理中';
 }
+function hasPartialTranscript(record) {
+    return Boolean(record.transcript_segments?.length || record.transcript_text?.trim());
+}
+function canRetryRecord(record) {
+    return ['failed', 'paused', 'completed'].includes(record.status);
+}
+function getRetryLabel(record) {
+    if (record.source_url && ['failed', 'paused'].includes(record.status) && hasPartialTranscript(record)) {
+        return '继续重试';
+    }
+    return '重试';
+}
+function hasRunningTranslationJob(record) {
+    return Object.values(record.translation_jobs ?? {}).some((job) => Boolean(job) && ['queued', 'processing'].includes(job.status));
+}
+function shouldShowTranslationAction() {
+    if (!translationEnabled.value || !selectedRecord.value || !canTranslateSelected.value) {
+        return false;
+    }
+    return selectedTranslationJob.value?.status !== 'completed';
+}
+function getTranslationActionLabel() {
+    const status = selectedTranslationJob.value?.status ?? 'idle';
+    if (status === 'queued' || status === 'processing') {
+        return '暂停翻译';
+    }
+    if (status === 'paused') {
+        return '继续翻译';
+    }
+    if (status === 'failed') {
+        return '重新继续翻译';
+    }
+    return '开始翻译';
+}
 function syncStatusNotifications(nextRecords) {
     let nextNotice = '';
     let nextError = '';
@@ -215,26 +292,27 @@ function syncStatusNotifications(nextRecords) {
         notice.value = '';
     }
 }
-async function ensureTranslation(record) {
-    if (!authStore.token || !translationEnabled.value || record.status !== 'completed') {
+async function handleTranslationAction() {
+    if (!authStore.token || !selectedRecord.value || !translationEnabled.value || !canTranslateSelected.value) {
         return;
     }
-    if (translationCache.value[record.id]?.[translationLanguage.value]) {
-        return;
-    }
-    translationLoading.value = true;
+    const activeJobStatus = selectedTranslationJob.value?.status ?? 'idle';
+    const isPauseAction = activeJobStatus === 'queued' || activeJobStatus === 'processing';
+    errorMessage.value = '';
     try {
-        const translated = await getTranslatedTranscript(record.id, translationLanguage.value, authStore.token);
-        translationCache.value = {
-            ...translationCache.value,
-            [record.id]: {
-                ...(translationCache.value[record.id] ?? {}),
-                [translationLanguage.value]: translated,
-            },
-        };
+        const updatedRecord = isPauseAction
+            ? await pauseTranscriptTranslation(selectedRecord.value.id, translationLanguage.value, authStore.token)
+            : await startTranscriptTranslation(selectedRecord.value.id, translationLanguage.value, authStore.token);
+        replaceRecordInState(updatedRecord);
+        notice.value = isPauseAction
+            ? '翻译已暂停，可稍后继续。'
+            : activeJobStatus === 'paused'
+                ? '翻译已继续处理。'
+                : '翻译任务已开始。';
+        await loadRecords();
     }
-    finally {
-        translationLoading.value = false;
+    catch (error) {
+        errorMessage.value = error instanceof Error ? error.message : '翻译处理失败';
     }
 }
 async function loadRecords() {
@@ -250,7 +328,7 @@ async function loadRecords() {
     if (selectedId.value !== null && !urlRecords.value.some((record) => record.id === selectedId.value)) {
         selectedId.value = urlRecords.value[0]?.id ?? null;
     }
-    const hasPendingTasks = urlRecords.value.some((record) => record.status === 'queued' || record.status === 'processing');
+    const hasPendingTasks = urlRecords.value.some((record) => record.status === 'queued' || record.status === 'processing' || hasRunningTranslationJob(record));
     if (hasPendingTasks && pollTimer === null) {
         pollTimer = window.setInterval(() => {
             loadRecords().catch((error) => {
@@ -290,6 +368,10 @@ async function handleDownloadTranscriptFile(uploadId) {
     if (!authStore.token) {
         return;
     }
+    if (translationEnabled.value && selectedTranslationJob.value?.status !== 'completed') {
+        errorMessage.value = '当前翻译尚未完成，请先继续处理或关闭翻译后再下载。';
+        return;
+    }
     errorMessage.value = '';
     try {
         const includeTranslation = translationEnabled.value;
@@ -306,6 +388,30 @@ async function handleDownloadTranscriptFile(uploadId) {
     }
     catch (error) {
         errorMessage.value = error instanceof Error ? error.message : '文件下载失败';
+    }
+}
+async function handleRetry(recordId) {
+    if (!authStore.token || retryingRecordId.value !== null) {
+        return;
+    }
+    const targetRecord = urlRecords.value.find((record) => record.id === recordId);
+    if (!targetRecord) {
+        return;
+    }
+    retryingRecordId.value = recordId;
+    errorMessage.value = '';
+    try {
+        await retryUpload(recordId, authStore.token);
+        notice.value = targetRecord.source_url && ['failed', 'paused'].includes(targetRecord.status) && hasPartialTranscript(targetRecord)
+            ? `${describeSource(targetRecord)} 已继续入队，会从上次失败位置后面继续处理`
+            : `${describeSource(targetRecord)} 已重新入队`;
+        await loadRecords();
+    }
+    catch (error) {
+        errorMessage.value = error instanceof Error ? error.message : 'URL 任务重试失败';
+    }
+    finally {
+        retryingRecordId.value = null;
     }
 }
 function handleSelect(record) {
@@ -338,14 +444,9 @@ async function handleStartTranscriptEdit() {
         return;
     }
     errorMessage.value = '';
-    if (translationEnabled.value && !selectedTranslation.value) {
-        try {
-            await ensureTranslation(selectedRecord.value);
-        }
-        catch (error) {
-            errorMessage.value = error instanceof Error ? error.message : '翻译加载失败';
-            return;
-        }
+    if (translationEnabled.value && selectedTranslationJob.value?.status !== 'completed') {
+        errorMessage.value = '翻译完成后才可以修正翻译文本。';
+        return;
     }
     beginTranscriptEdit();
 }
@@ -371,29 +472,6 @@ async function handleSaveTranscriptEdit() {
     try {
         const updatedRecord = await updateTranscriptCorrection(selectedRecord.value.id, payload, authStore.token);
         replaceRecordInState(updatedRecord);
-        if (editingTranslation.value) {
-            const nextTranslation = {
-                target_language: translationLanguage.value,
-                target_language_label: selectedTranslation.value?.target_language_label ?? translationOptions.find((option) => option.value === translationLanguage.value)?.label ?? translationLanguage.value,
-                text: transcriptDraftSegments.value.length
-                    ? transcriptDraftSegments.value.map((segment) => segment.text.trim()).filter(Boolean).join('\n')
-                    : transcriptDraftText.value.trim(),
-                segments: transcriptDraftSegments.value.map((segment) => ({ ...segment })),
-            };
-            translationCache.value = {
-                ...translationCache.value,
-                [updatedRecord.id]: {
-                    ...(translationCache.value[updatedRecord.id] ?? {}),
-                    [translationLanguage.value]: nextTranslation,
-                },
-            };
-        }
-        else {
-            translationCache.value = {
-                ...translationCache.value,
-                [updatedRecord.id]: {},
-            };
-        }
         notice.value = editingTranslation.value ? '翻译文本已保存修正。' : '原文已保存修正。';
         cancelTranscriptEdit();
         await nextTick();
@@ -427,9 +505,6 @@ async function handleDelete(recordId) {
     errorMessage.value = '';
     try {
         await deleteUpload(recordId, authStore.token);
-        const nextCache = { ...translationCache.value };
-        delete nextCache[recordId];
-        translationCache.value = nextCache;
         notice.value = `${describeSource(targetRecord)} 已删除`;
         await loadRecords();
     }
@@ -540,17 +615,6 @@ watch(selectedRecord, async (record, previousRecord) => {
         activeSegmentIndex.value = -1;
     }
     selectedId.value = record.id;
-    if (translationEnabled.value
-        && record.status === 'completed'
-        && selectedHasTranscript.value
-        && (selectedRecordChanged || previousRecord?.status !== record.status)) {
-        try {
-            await ensureTranslation(record);
-        }
-        catch (error) {
-            errorMessage.value = error instanceof Error ? error.message : '翻译加载失败';
-        }
-    }
     await nextTick();
     setMediaElementState();
 });
@@ -559,14 +623,8 @@ watch([translationEnabled, translationLanguage], async ([enabled]) => {
     if (!enabled || !selectedRecord.value || !canTranslateSelected.value) {
         return;
     }
-    try {
-        await ensureTranslation(selectedRecord.value);
-        await nextTick();
-        setMediaElementState();
-    }
-    catch (error) {
-        errorMessage.value = error instanceof Error ? error.message : '翻译加载失败';
-    }
+    await nextTick();
+    setMediaElementState();
 });
 watch(activeSegmentIndex, async (index) => {
     if (index < 0) {
@@ -747,7 +805,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements
 __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
     id: "translation-toggle",
     type: "checkbox",
-    disabled: (!__VLS_ctx.canTranslateSelected || __VLS_ctx.translationLoading),
+    disabled: (!__VLS_ctx.canTranslateSelected),
 });
 (__VLS_ctx.translationEnabled);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -762,6 +820,14 @@ for (const [option] of __VLS_getVForSourceType((__VLS_ctx.translationOptions))) 
         value: (option.value),
     });
     (option.label);
+}
+if (__VLS_ctx.shouldShowTranslationAction()) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.handleTranslationAction) },
+        ...{ class: "ghost-button" },
+        type: "button",
+    });
+    (__VLS_ctx.getTranslationActionLabel());
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.select, __VLS_intrinsicElements.select)({
     value: (__VLS_ctx.downloadFormat),
@@ -778,6 +844,19 @@ if (__VLS_ctx.showTranslationSkeleton) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
         ...{ class: "status-badge status-badge--loading" },
     });
+}
+if (__VLS_ctx.selectedRecord && __VLS_ctx.canRetryRecord(__VLS_ctx.selectedRecord)) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (...[$event]) => {
+                if (!(__VLS_ctx.selectedRecord && __VLS_ctx.canRetryRecord(__VLS_ctx.selectedRecord)))
+                    return;
+                __VLS_ctx.handleRetry(__VLS_ctx.selectedRecord.id);
+            } },
+        ...{ class: "ghost-button" },
+        type: "button",
+        disabled: (__VLS_ctx.retryingRecordId === __VLS_ctx.selectedRecord.id),
+    });
+    (__VLS_ctx.retryingRecordId === __VLS_ctx.selectedRecord.id ? '提交中...' : __VLS_ctx.getRetryLabel(__VLS_ctx.selectedRecord));
 }
 if (__VLS_ctx.selectedRecord) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
@@ -845,6 +924,12 @@ if (__VLS_ctx.translationStatusMessage) {
         ...{ class: "notice" },
     });
     (__VLS_ctx.translationStatusMessage);
+}
+if (__VLS_ctx.selectedTranslationError) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "error-box" },
+    });
+    (__VLS_ctx.selectedTranslationError);
 }
 if (__VLS_ctx.selectedPersistentError) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
@@ -1071,6 +1156,21 @@ if (__VLS_ctx.urlRecords.length) {
             ...{ class: "secondary-button" },
             type: "button",
         });
+        if (__VLS_ctx.canRetryRecord(record)) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.urlRecords.length))
+                            return;
+                        if (!(__VLS_ctx.canRetryRecord(record)))
+                            return;
+                        __VLS_ctx.handleRetry(record.id);
+                    } },
+                ...{ class: "ghost-button" },
+                type: "button",
+                disabled: (__VLS_ctx.retryingRecordId === record.id),
+            });
+            (__VLS_ctx.retryingRecordId === record.id ? '提交中...' : __VLS_ctx.getRetryLabel(record));
+        }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
             ...{ onClick: (...[$event]) => {
                     if (!(__VLS_ctx.urlRecords.length))
@@ -1125,8 +1225,10 @@ else {
 /** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
 /** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
 /** @type {__VLS_StyleScopedClasses['toggle-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
 /** @type {__VLS_StyleScopedClasses['status-badge--loading']} */ ;
+/** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['sync-panel']} */ ;
@@ -1140,6 +1242,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
+/** @type {__VLS_StyleScopedClasses['error-box']} */ ;
 /** @type {__VLS_StyleScopedClasses['error-box']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-track']} */ ;
@@ -1188,6 +1291,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['ghost-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['danger-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 var __VLS_dollars;
@@ -1201,7 +1305,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             translationEnabled: translationEnabled,
             translationLanguage: translationLanguage,
             downloadFormat: downloadFormat,
-            translationLoading: translationLoading,
+            retryingRecordId: retryingRecordId,
             deletingRecordId: deletingRecordId,
             currentTime: currentTime,
             activeSegmentIndex: activeSegmentIndex,
@@ -1214,11 +1318,13 @@ const __VLS_self = (await import('vue')).defineComponent({
             urlRecords: urlRecords,
             selectedRecord: selectedRecord,
             selectedSegments: selectedSegments,
+            translationLoading: translationLoading,
             translatedSegments: translatedSegments,
             translatedTranscriptText: translatedTranscriptText,
             canTranslateSelected: canTranslateSelected,
             showTranslationSkeleton: showTranslationSkeleton,
             translationStatusMessage: translationStatusMessage,
+            selectedTranslationError: selectedTranslationError,
             selectedPersistentError: selectedPersistentError,
             selectedPersistentNotice: selectedPersistentNotice,
             mediaUrl: mediaUrl,
@@ -1229,8 +1335,14 @@ const __VLS_self = (await import('vue')).defineComponent({
             transcriptEditTitle: transcriptEditTitle,
             normalizeProgressPercent: normalizeProgressPercent,
             formatProgressStage: formatProgressStage,
+            canRetryRecord: canRetryRecord,
+            getRetryLabel: getRetryLabel,
+            shouldShowTranslationAction: shouldShowTranslationAction,
+            getTranslationActionLabel: getTranslationActionLabel,
+            handleTranslationAction: handleTranslationAction,
             handleSubmit: handleSubmit,
             handleDownloadTranscriptFile: handleDownloadTranscriptFile,
+            handleRetry: handleRetry,
             handleSelect: handleSelect,
             cancelTranscriptEdit: cancelTranscriptEdit,
             handleStartTranscriptEdit: handleStartTranscriptEdit,

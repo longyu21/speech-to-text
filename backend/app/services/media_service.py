@@ -98,14 +98,18 @@ def normalize_tts_output_format(output_format: str | None) -> str:
     return normalized
 
 
-def prepare_media_for_transcription(file_path: Path) -> Path:
+def prepare_media_for_transcription(file_path: Path, *, start_offset_seconds: float = 0.0) -> Path:
     suffix = file_path.suffix.lower()
     if suffix not in SUPPORTED_TRANSCRIPTION_EXTENSIONS:
         raise ValueError("Unsupported transcription media format")
 
     with tempfile.TemporaryDirectory(prefix="stt-media-") as temp_dir:
         target_path = Path(temp_dir) / f"{file_path.stem}.wav"
-        _run_ffmpeg([
+        ffmpeg_arguments: list[str] = []
+        normalized_offset = max(0.0, float(start_offset_seconds or 0.0))
+        if normalized_offset > 0:
+            ffmpeg_arguments.extend(["-ss", f"{normalized_offset:.2f}"])
+        ffmpeg_arguments.extend([
             "-i",
             str(file_path),
             "-vn",
@@ -115,6 +119,7 @@ def prepare_media_for_transcription(file_path: Path) -> Path:
             "16000",
             str(target_path),
         ])
+        _run_ffmpeg(ffmpeg_arguments)
         persisted_path = file_path.parent / f"{file_path.stem}-{uuid4().hex}.wav"
         persisted_path.write_bytes(target_path.read_bytes())
         return persisted_path

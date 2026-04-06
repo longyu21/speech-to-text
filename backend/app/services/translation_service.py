@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from math import isfinite
 
 from deep_translator import GoogleTranslator
@@ -21,7 +22,15 @@ SEGMENT_BATCH_SIZE = 32
 TEXT_CHUNK_LIMIT = 4000
 
 
+TranslationProgressCallback = Callable[[str, list[dict[str, object]], int, int], None]
+PauseCheckCallback = Callable[[], bool]
+
+
 class TranslationServiceError(RuntimeError):
+    pass
+
+
+class TranslationPausedError(RuntimeError):
     pass
 
 
@@ -35,6 +44,10 @@ def translate_transcript(
     transcript_segments: list[dict[str, object]] | None,
     target_language: str,
     source_language: str | None = None,
+    *,
+    progress_callback: TranslationProgressCallback | None = None,
+    should_pause: PauseCheckCallback | None = None,
+    existing_segments: list[dict[str, object]] | None = None,
 ) -> tuple[str, list[dict[str, object]]]:
     normalized_target = _normalize_language_code(target_language)
     cleaned_text = transcript_text.strip()
@@ -43,23 +56,57 @@ def translate_transcript(
 
     normalized_source = (source_language or "").strip().lower()
     normalized_segments = _normalize_segments(transcript_segments)
+    normalized_existing_segments = _normalize_segments(existing_segments)
     if normalized_source == normalized_target:
+        if progress_callback is not None:
+            progress_callback(cleaned_text, normalized_segments, len(normalized_segments), len(normalized_segments))
         return cleaned_text, normalized_segments
 
     try:
         if normalized_segments:
-            translated_segments = _translate_segment_batch(normalized_segments, normalized_target)
+            translated_segments = _translate_segment_batch(
+                normalized_segments,
+                normalized_target,
+                progress_callback=progress_callback,
+                should_pause=should_pause,
+                existing_segments=normalized_existing_segments,
+            )
             translated_text = "\n".join(segment["text"] for segment in translated_segments if str(segment["text"]).strip())
             return translated_text or _translate_long_text(cleaned_text, normalized_target), translated_segments
-        return _translate_long_text(cleaned_text, normalized_target), []
+        translated_text = _translate_long_text(cleaned_text, normalized_target)
+        if progress_callback is not None:
+            progress_callback(translated_text, [], 1, 1)
+        return translated_text, []
+    except TranslationPausedError:
+        raise
     except Exception as exc:
         raise TranslationServiceError(f"Translation failed: {exc}") from exc
 
 
-def _translate_segment_batch(segments: list[dict[str, object]], target_language: str) -> list[dict[str, object]]:
-    translated_segments: list[dict[str, object]] = []
+def _translate_segment_batch(
+    segments: list[dict[str, object]],
+    target_language: str,
+    *,
+    progress_callback: TranslationProgressCallback | None = None,
+    should_pause: PauseCheckCallback | None = None,
+    existing_segments: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    translated_segments: list[dict[str, object]] = list(existing_segments or [])
     translator = GoogleTranslator(source="auto", target=TRANSLATION_TARGET_CODES[target_language])
-    for start_index in range(0, len(segments), SEGMENT_BATCH_SIZE):
+    total_segments = len(segments)
+    translated_count = len(translated_segments)
+
+    if progress_callback is not None and translated_segments:
+        progress_callback(
+            "\n".join(segment["text"] for segment in translated_segments if str(segment["text"]).strip()),
+            list(translated_segments),
+            translated_count,
+            total_segments,
+        )
+
+    for start_index in range(translated_count, len(segments), SEGMENT_BATCH_SIZE):
+        if should_pause is not None and should_pause():
+            raise TranslationPausedError("Translation paused")
         batch = segments[start_index:start_index + SEGMENT_BATCH_SIZE]
         translated_texts = translator.translate_batch([str(segment["text"]) for segment in batch])
         for segment, translated_text in zip(batch, translated_texts, strict=False):
@@ -69,6 +116,14 @@ def _translate_segment_batch(segments: list[dict[str, object]], target_language:
                     "end": segment["end"],
                     "text": str(translated_text or segment["text"]).strip(),
                 }
+            )
+        translated_count = len(translated_segments)
+        if progress_callback is not None:
+            progress_callback(
+                "\n".join(segment["text"] for segment in translated_segments if str(segment["text"]).strip()),
+                list(translated_segments),
+                translated_count,
+                total_segments,
             )
     return translated_segments
 
